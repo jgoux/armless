@@ -299,13 +299,16 @@ def cmd_cell(a):
     summary = au.parse_trace(tr["stderr"]) if os.path.getsize(tr["stderr"]) else None
     if summary is not None and rep is not None:
         kind, verdict = au.classify({"report": rep, "exit": tr["exit"], "stderr_tail": ""}, summary, fault)
+    elif (m_ := re.findall(r"^armless-exec: (.+)$", open(tr["stderr"], errors="replace").read(), re.M)):
+        # the runner refused the program before running a single instruction (the ELF loader, the filesystem)
+        kind, verdict = "loader", f"armless-exec refused to start the program: {m_[-1]} (exit {tr['exit']}, before the first instruction)"
     elif summary is not None:
         kind, verdict = "unclassified", f"armless-exec did not reach its report in the traced run (exit {tr['exit']}; {tr['failure']})"
     else:
         kind, verdict = "unclassified", "the traced run left no trace"
     result.update(kind=kind, verdict=verdict, traced_failure=tr["failure"], traced_status=(rep or {}).get("status"), fault=fault,
                   trace=summary, stderr_tail=tail_lines(tr["stderr"]), traced_stdout_tail=tail_lines(tr["stdout"], 20))
-    result["first_failure"] = verdict if kind == "blocked" else f"{run['failure']}; {verdict}"
+    result["first_failure"] = verdict if kind in ("blocked", "loader") else f"{run['failure']}; {verdict}"
     for p_ in (run["stderr"], tr["stderr"]):
         squeeze(p_)
     return finish()
