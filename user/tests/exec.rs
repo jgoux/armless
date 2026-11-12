@@ -3189,7 +3189,6 @@ fn a_process_descriptor_has_a_proc_link_and_fdinfo() {
     assert!(matches!(status, Status::Exited(0)), "{status:?}");
 }
 
-
 // ------------------------------------------------------------ scheduler calls
 
 const SCHED_FIFO: u32 = 1;
@@ -3296,10 +3295,18 @@ fn setscheduler_is_checked_and_read_back_by_getscheduler_and_getparam() {
     a.getscheduler().sched_is(1);
     a.getparam().sched_is(0).word32_is(BUF, 10);
     // sched_setparam changes the priority and keeps the policy
-    a.sw(BUF, 42).movz(0, 0).sp_plus(1, BUF).svc(118).sched_is(0);
+    a.sw(BUF, 42)
+        .movz(0, 0)
+        .sp_plus(1, BUF)
+        .svc(118)
+        .sched_is(0);
     a.getparam().sched_is(0).word32_is(BUF, 42);
     a.getscheduler().sched_is(1);
-    a.sw(BUF, 100).movz(0, 0).sp_plus(1, BUF).svc(118).sched_is(-22);
+    a.sw(BUF, 100)
+        .movz(0, 0)
+        .sp_plus(1, BUF)
+        .svc(118)
+        .sched_is(-22);
     // a priority a policy doesn't take, a policy that isn't one, deadline, bad pointers
     a.setscheduler(SCHED_FIFO, 0).sched_is(-22);
     a.setscheduler(SCHED_FIFO, 100).sched_is(-22);
@@ -3345,7 +3352,11 @@ fn nice_goes_through_setpriority_and_getpriority_for_the_thread_the_group_and_th
     a.getpriority().sched_is(14);
     // no such thread, group or user, no such kind
     a.movz(0, 0).mov32(1, 99_999).svc(141).sched_is(-3);
-    a.movz(0, 0).mov32(1, 99_999).movz(2, 0).svc(140).sched_is(-3);
+    a.movz(0, 0)
+        .mov32(1, 99_999)
+        .movz(2, 0)
+        .svc(140)
+        .sched_is(-3);
     a.movz(0, 1).mov32(1, 99_999).svc(141).sched_is(-3);
     a.movz(0, 2).mov32(1, 1234).svc(141).sched_is(-3);
     a.movz(0, 3).movz(1, 0).svc(141).sched_is(-22);
@@ -3391,17 +3402,19 @@ fn reset_on_fork_gives_the_child_a_normal_thread_and_clears_the_flag() {
     let mut a = Asm::default();
     a.sched_room();
     a.setscheduler(SCHED_FIFO | RESET_ON_FORK, 10).sched_is(0);
-    a.getscheduler().sched_is((RESET_ON_FORK | SCHED_FIFO) as i64);
+    a.getscheduler()
+        .sched_is((RESET_ON_FORK | SCHED_FIFO) as i64);
     a.setpriority(-5).sched_is(0);
     child_checks(&mut a, |c| {
         c.getscheduler().sched_is(0);
         c.getparam().sched_is(0).word32_is(BUF, 0);
         c.getpriority().sched_is(20); // a negative nice goes back to 0
-                                // and it doesn't pass the reset on: its own child is as it is
+                                      // and it doesn't pass the reset on: its own child is as it is
         c.setscheduler(SCHED_RR, 5).sched_is(0);
     });
     // the parent keeps its own
-    a.getscheduler().sched_is((RESET_ON_FORK | SCHED_FIFO) as i64);
+    a.getscheduler()
+        .sched_is((RESET_ON_FORK | SCHED_FIFO) as i64);
     a.getpriority().sched_is(25);
     // setpriority's nice is also kept by a thread's policy change
     a.setscheduler(0, 0).sched_is(0);
@@ -3497,10 +3510,18 @@ fn sched_getattr_fills_what_fits_and_sched_setattr_takes_it_back() {
     a.getparam().sched_is(0).word32_is(BUF, 20);
     // a size too small, or too big with something in the extra, is E2BIG and the size it knows
     a.sw(BUF, 20);
-    a.movz(0, 0).sp_plus(1, BUF).movz(2, 0).svc(274).sched_is(-7);
+    a.movz(0, 0)
+        .sp_plus(1, BUF)
+        .movz(2, 0)
+        .svc(274)
+        .sched_is(-7);
     a.word32_is(BUF, 56);
     a.sw(BUF, 64).sw(BUF + 60, 1);
-    a.movz(0, 0).sp_plus(1, BUF).movz(2, 0).svc(274).sched_is(-7);
+    a.movz(0, 0)
+        .sp_plus(1, BUF)
+        .movz(2, 0)
+        .svc(274)
+        .sched_is(-7);
     a.word32_is(BUF, 56);
     a.sw(BUF + 60, 0);
     // flags nobody has, a priority the policy doesn't take, deadline, flags in the call
@@ -3508,13 +3529,29 @@ fn sched_getattr_fills_what_fits_and_sched_setattr_takes_it_back() {
         .sw(BUF + 4, 1)
         .sw(BUF + 8, 0x80)
         .sw(BUF + 20, 5);
-    a.movz(0, 0).sp_plus(1, BUF).movz(2, 0).svc(274).sched_is(-22);
+    a.movz(0, 0)
+        .sp_plus(1, BUF)
+        .movz(2, 0)
+        .svc(274)
+        .sched_is(-22);
     a.sw(BUF + 8, 0).sw(BUF + 20, 0);
-    a.movz(0, 0).sp_plus(1, BUF).movz(2, 0).svc(274).sched_is(-22);
+    a.movz(0, 0)
+        .sp_plus(1, BUF)
+        .movz(2, 0)
+        .svc(274)
+        .sched_is(-22);
     a.sw(BUF + 4, 6);
-    a.movz(0, 0).sp_plus(1, BUF).movz(2, 0).svc(274).sched_is(-1);
+    a.movz(0, 0)
+        .sp_plus(1, BUF)
+        .movz(2, 0)
+        .svc(274)
+        .sched_is(-1);
     a.sw(BUF + 4, 0);
-    a.movz(0, 0).sp_plus(1, BUF).movz(2, 1).svc(274).sched_is(-22);
+    a.movz(0, 0)
+        .sp_plus(1, BUF)
+        .movz(2, 1)
+        .svc(274)
+        .sched_is(-22);
     a.mov32(0, 99_999)
         .sp_plus(1, BUF)
         .movz(2, 0)
