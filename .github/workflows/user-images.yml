@@ -195,7 +195,7 @@ jobs:
           set -o pipefail
           mkdir -p data
           extra=()
-          for a in $EXEC_ARGS; do extra+=(--exec-arg "$a"); done
+          for a in $EXEC_ARGS; do extra+=("--exec-arg=$a"); done
           python3 -I $IMAGES/harness.py cell --image ${{ matrix.image }} --fs "$PWD/pkg" --armless-exec "$PWD/bin/armless-exec" --out data \
             --ready-timeout "$READY_TIMEOUT" "${extra[@]}" 2>&1 | tee data/harness.log
       - uses: actions/upload-artifact@v4
