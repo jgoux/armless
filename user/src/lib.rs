@@ -39,6 +39,7 @@ pub mod host;
 mod mm;
 mod net;
 mod proc;
+mod sched;
 mod ser;
 mod signal;
 mod sys;
@@ -150,6 +151,7 @@ pub(crate) struct Thread {
     pub resume_deadline: Option<Instant>,
     pub exited: bool,
     pub sig: ThreadSig,
+    pub sched: sched::Sched,
 }
 
 /// What a syscall does to the thread that made it.
@@ -614,6 +616,7 @@ impl Process {
             resume_deadline: None,
             exited: false,
             sig: ThreadSig::default(),
+            sched: Default::default(),
         });
         Ok(p)
     }
@@ -1207,6 +1210,7 @@ impl Process {
             w.u(left(t.wait.as_ref().and_then(|(_, d)| *d)));
             w.u(left(t.resume_deadline));
             t.sig.save(&mut w);
+            t.sched.save(&mut w);
         }
         // The timers (a state from before them ends here)
         self.timers.save(&mut w, now);
@@ -1363,6 +1367,7 @@ impl Process {
                 resume_deadline,
                 exited,
                 sig: ThreadSig::load(&mut r)?,
+                sched: sched::Sched::load(&mut r)?,
             });
         }
         let timers = if r.0.is_empty() { Timers::default() } else { Timers::load(&mut r, now)? };
