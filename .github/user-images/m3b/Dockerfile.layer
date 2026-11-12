@@ -1,0 +1,5 @@
+# The layer the gate puts on an image: ctx/ is laid out as the files land (the launcher and the example's code of a runtime, the
+# in-guest driver and the scenario scripts under /m3b). The image's own metadata (Entrypoint, Cmd, Env, WorkingDir) is untouched.
+ARG BASE
+FROM ${BASE}
+COPY ctx/ /

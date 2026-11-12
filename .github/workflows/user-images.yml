@@ -1,0 +1,230 @@
+# armless user mode (`armless-exec`, user/) on supa-wasm's seven user-mode gate images (go, node, nginx, python, shell, deno, node-runtime): does each
+# one become ready, does it pass its serve checks, and where does it first fail. For this fork only, never for upstream (it lives on ci/user-images).
+#   source   the refs, merged: the first ref, then each next one merged onto it (git merge); the tree is handed over as an artifact
+#   build    armless-exec, native, its default build (the native JIT is compiled in and stays off), on an arm runner
+#   package  per image: the Dockerfile built as linux/arm64 (the arm runner: no emulation), `docker save`d, flattened into armless's filesystem
+#            (fs.json + blobs/, made with the tools of tests/fs of the tree under test) with its launch config
+#   cell     per image: harness.py starts the image under armless-exec, probes it from the host, applies the serve checks, and on a failure
+#            runs it again with the system call trace to classify the first failure
+#   report   the table (job summary and artifact user-images-summary) and the per-image evidence (artifacts cell-<image>)
+# Images, Dockerfiles and checks are supa-wasm's (experiments/usermode/gates/m2a, m2b, m3b, m4a and compute/ at um/int), copied under .github/user-images/.
+# A cell fails only when the harness itself fails; an image that does not serve is a row of the table, not a red job.
+#
+# Dispatch (the `ref` input is the list: comma-separated, merged in order; a ref is a branch, tag or sha of this fork, or `upstream:<ref>`):
+#   gh workflow run user-images.yml -R jgoux/armless --ref ci/user-images -f ref=main
+#   gh workflow run user-images.yml -R jgoux/armless --ref ci/user-images -f ref=feat/user-sockets,feat/user-processes
+# A push to ci/user-images runs the refs of .github/user-images/REFS.
+name: user-images
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "armless ref(s), comma-separated, merged in order (branch/tag/sha of this fork, or upstream:<ref>)"
+        default: main
+      exec_args:
+        description: "extra armless-exec options, space-separated (e.g. a flag a ref adds to reach the guest's ports)"
+        default: ""
+      ready_timeout:
+        description: "seconds an image gets to become ready"
+        default: "300"
+  push:
+    branches: [ci/user-images]
+
+env:
+  IMAGES: .github/user-images
+
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      description: ${{ steps.merge.outputs.description }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The refs, merged
+        id: merge
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          refs="$INPUT_REF"
+          [ -n "$refs" ] || refs=$(grep -v '^#' "$IMAGES/REFS" | tr -d ' \n')
+          git remote add upstream https://github.com/filipecabaco/armless.git
+          resolve() {
+            local r="$1"
+            case "$r" in
+              upstream:*) git fetch -q --no-tags upstream "${r#upstream:}" && git rev-parse "FETCH_HEAD^{commit}" ;;
+              *) git rev-parse --verify -q "origin/$r^{commit}" || git rev-parse --verify -q "refs/tags/$r^{commit}" || git rev-parse --verify -q "$r^{commit}" ;;
+            esac
+          }
+          desc=""
+          first=1
+          IFS=',' read -ra list <<< "$refs"
+          for r in "${list[@]}"; do
+            r=$(echo "$r" | tr -d ' ')
+            [ -n "$r" ] || continue
+            sha=$(resolve "$r") || { echo "::error::cannot resolve ref '$r' (a branch, tag or sha of this fork, or upstream:<ref>)"; exit 1; }
+            if [ -n "$first" ]; then
+              git checkout -q --detach "$sha"
+              first=""
+              desc="$r@${sha:0:9}"
+            else
+              git -c user.name=user-images -c user.email=user-images@localhost merge -q --no-edit --no-ff "$sha" || { echo "::error::merging '$r' ($sha) onto $desc conflicts"; git status --short | head -20; exit 1; }
+              desc="$desc + $r@${sha:0:9}"
+            fi
+          done
+          [ -z "$first" ] || { echo "::error::no refs given"; exit 1; }
+          head=$(git rev-parse HEAD)
+          version=$(grep -m1 '^version = ' user/Cargo.toml | cut -d'"' -f2)
+          desc="armless \`$desc\` (user $version, tree ${head:0:9})"
+          echo "$desc"
+          echo "description=$desc" >> "$GITHUB_OUTPUT"
+          echo "$desc" >> "$GITHUB_STEP_SUMMARY"
+          git archive --format=tar.gz -o "$RUNNER_TEMP/armless-src.tar.gz" HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: armless-src
+          path: ${{ runner.temp }}/armless-src.tar.gz
+
+  build:
+    needs: source
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: armless-src
+      - run: mkdir armless-src && tar -C armless-src -xzf armless-src.tar.gz
+      - name: Toolchain (the crate needs Rust 1.97)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "armless-src -> build"
+      - name: armless-exec
+        working-directory: armless-src
+        run: |
+          cargo build --release -p armless-user --bin armless-exec
+          mkdir -p ../bin
+          cp build/release/armless-exec ../bin/
+          ../bin/armless-exec 2>&1 | head -3 || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: armless-exec
+          path: bin/armless-exec
+
+  package:
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [go, node, nginx, python, shell, deno, node-runtime]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: armless-src
+      - run: mkdir armless-src && tar -C armless-src -xzf armless-src.tar.gz
+      - name: The image (linux/arm64)
+        run: |
+          set -e
+          case "${{ matrix.image }}" in
+            go|node|nginx|python|shell)
+              docker build --platform linux/arm64 -t ui:image $IMAGES/images/${{ matrix.image }} ;;
+            *)
+              rt=${{ matrix.image }}; rt=${rt%-runtime}
+              WI=$IMAGES/workers-infra
+              code=main.ts; [ "$rt" = node ] && code=index.mjs
+              docker build --platform linux/arm64 -t ui:base -f $WI/backends/lambda/images/$rt/Dockerfile $WI
+              mkdir -p lay/ctx/opt/workers lay/ctx/app
+              cp $WI/backends/lambda/shims/launcher.mjs lay/ctx/opt/workers/launcher.mjs
+              cp $WI/examples/lambda/$rt/$code lay/ctx/app/$code
+              cp $IMAGES/m3b/Dockerfile.layer lay/Dockerfile
+              docker build --platform linux/arm64 -t ui:image --build-arg BASE=ui:base lay ;;
+          esac
+          mkdir out
+          docker save ui:image -o out/image.tar
+          ls -l out
+      - name: The armless filesystem
+        run: |
+          set -euo pipefail
+          sudo pip3 install --break-system-packages zstandard
+          python3 -I $IMAGES/m4a/armless_fs.py out/image.tar out/pkg armless-src
+          du -sh out/pkg
+          tail -3 out/pkg/armless-fs.log
+          cat out/pkg/config.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.image }}
+          path: out/pkg
+          compression-level: 1
+
+  cell:
+    needs: [build, package]
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [go, node, nginx, python, shell, deno, node-runtime]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: armless-exec
+          path: bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-${{ matrix.image }}
+          path: pkg
+      - run: |
+          chmod +x bin/armless-exec
+          sudo apt-get install -y -qq zstd
+          ls pkg
+      - name: The cell (${{ matrix.image }})
+        env:
+          EXEC_ARGS: ${{ inputs.exec_args }}
+          READY_TIMEOUT: ${{ inputs.ready_timeout || '300' }}
+        run: |
+          set -o pipefail
+          mkdir -p data
+          extra=()
+          for a in $EXEC_ARGS; do extra+=(--exec-arg "$a"); done
+          python3 -I $IMAGES/harness.py cell --image ${{ matrix.image }} --fs "$PWD/pkg" --armless-exec "$PWD/bin/armless-exec" --out data \
+            --ready-timeout "$READY_TIMEOUT" "${extra[@]}" 2>&1 | tee data/harness.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cell-${{ matrix.image }}
+          path: data
+
+  report:
+    needs: [source, cell]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cell-*
+          path: cells
+      - name: The table
+        env:
+          SOURCE: ${{ needs.source.outputs.description }}
+        run: |
+          mkdir -p summary cells
+          python3 -I $IMAGES/harness.py report --in cells --out summary --source "$SOURCE" > /dev/null
+          cat summary/summary.md >> "$GITHUB_STEP_SUMMARY"
+          cat summary/summary.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: user-images-summary
+          path: summary
