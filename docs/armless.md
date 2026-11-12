@@ -269,6 +269,20 @@ x0–x5, answers it in x0, and resumes at ELR.
   output not taken yet (unless NOFLSH) and echoing `^C`; a new size is SIGWINCH; output
   newlines start a line (ONLCR).
 - **Pipes, eventfd, epoll** (edge-triggered and one-shot too), **poll and select.**
+- **Groups, AIO, preadv2 and pwritev2** (user/src/aio.rs): `setgroups` and `getgroups` keep a
+  supplementary group list per process (a fork inherits it, exec keeps it; the program is root,
+  so any list up to 65536 is allowed). Native AIO (`io_setup`, `io_destroy`, `io_submit`,
+  `io_cancel`, `io_getevents`, `io_pgetevents`) is synchronous: PREAD, PWRITE, PREADV, PWRITEV,
+  FSYNC and FDSYNC run as they are submitted and their completions wait in the context's queue;
+  IOCB_FLAG_RESFD adds 1 to the eventfd. A context is named by the address of one zeroed page
+  (no ring header for a library to read, so libaio asks the kernel), belongs to its process and
+  is dropped by exec; it is not inherited. A timeout that passes with fewer than min_nr
+  completions returns the ones there are. Not done: IOCB_CMD_POLL and the signal mask of
+  `io_pgetevents`. `preadv2` and `pwritev2` take RWF_HIPRI, DSYNC, SYNC and DONTCACHE (no-ops:
+  the filesystem is in memory), NOWAIT (EAGAIN for a call that would wait), APPEND and NOAPPEND;
+  a position of -1 is the descriptor's own; other flags (RWF_ATOMIC) are EOPNOTSUPP. A
+  positioned write (`pwrite64`, `pwritev`, `pwritev2`, AIO) on a descriptor opened with
+  O_APPEND writes at the end of the file, as on Linux, unless RWF_NOAPPEND is given.
 - **Sockets** (user/src/net.rs): `socket`, `socketpair`, `bind`, `listen`, `accept` and `accept4`,
   `connect`, `sendto` and `recvfrom`, `sendmsg` and `recvmsg` (and the `mmsg` pair), `shutdown`,
   `getsockname`, `getpeername`, `getsockopt` and `setsockopt`; a socket is a descriptor like a
@@ -389,9 +403,9 @@ x0–x5, answers it in x0, and resumes at ELR.
   the rest (the processes, their threads and waits, their memory maps and lazy mappings, descriptors
   and pipes, the terminal, the clock, signals), a few tens of KB; the frames and page tables
   are in the machine's RAM. `Process::restore` takes it on a machine that loaded the snapshot.
-  A state from before 0.14.1 does not load (`ARMLUSR6`: addresses are virtual, there are
-  processes, the sockets are in the machine's state, and a message in flight carries its
-  descriptors and its sender).
+  A state from before 0.14.6 does not load (`ARMLUSR6`: addresses are virtual, there are
+  processes, the sockets are in the machine's state, a message in flight carries its descriptors
+  and its sender, and each process has its supplementary groups and its AIO contexts).
 - **The host:** `host.rs` is all user mode takes from the host besides the machine: a monotonic
   clock (`Instant`), the wall clock and randomness. Natively they are std's and the system's;
   in WebAssembly, whose std has no clock, they are armless's JavaScript imports (`microtick`,

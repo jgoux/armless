@@ -120,7 +120,7 @@ impl Process {
     }
 
     /// Up to `max` bytes from `fd` (at `at`, for pread), or what the call must do instead.
-    fn read_fd(&mut self, fd: i32, max: usize, at: Option<u64>) -> Result<Vec<u8>, Ret> {
+    pub(crate) fn read_fd(&mut self, fd: i32, max: usize, at: Option<u64>) -> Result<Vec<u8>, Ret> {
         let nonblock = self.nonblock(fd);
         let Some(d) = self.files.get(fd).cloned() else {
             return Err(Ret::Val(-EBADF));
@@ -238,7 +238,19 @@ impl Process {
     }
 
     /// Writes `data` to `fd` (at `at`, for pwrite): how much it took, or what the call must do.
-    fn write_fd(&mut self, fd: i32, data: &[u8], at: Option<u64>) -> Result<usize, Ret> {
+    /// As on Linux, a write at a position on a file opened for appending goes to its end.
+    pub(crate) fn write_fd(&mut self, fd: i32, data: &[u8], at: Option<u64>) -> Result<usize, Ret> {
+        self.write_fd_at(fd, data, at, false)
+    }
+
+    /// `write_fd`, with `noappend` (RWF_NOAPPEND) for a write at `at` though the file appends.
+    pub(crate) fn write_fd_at(
+        &mut self,
+        fd: i32,
+        data: &[u8],
+        at: Option<u64>,
+        noappend: bool,
+    ) -> Result<usize, Ret> {
         let nonblock = self.nonblock(fd);
         let Some(d) = self.files.get(fd).cloned() else {
             return Err(Ret::Val(-EBADF));
@@ -259,8 +271,12 @@ impl Process {
                 let now = self.now_secs();
                 let append = d.flags & O_APPEND != 0;
                 let r = self.fs(|fs| {
-                    let off =
-                        at.unwrap_or(if append { fs.get(ino).map_or(0, |i| i.size) } else { pos });
+                    let end = || fs.get(ino).map_or(0, |i| i.size);
+                    let off = match at {
+                        Some(a) if !append || noappend => a,
+                        _ if append => end(),
+                        _ => pos,
+                    };
                     got(fs.write(ino, off, data, now)).map_ok(|n| (n, off))
                 });
                 match r {
@@ -1424,8 +1440,16 @@ impl Process {
             155 | 156 => self.sys_getpgid(nr, a[0] as i32 as i64),
             157 => self.sys_setsid(),
             154 => self.sys_setpgid(a[0] as i32 as i64, a[1] as i32 as i64),
-            // getgroups
-            158 => v(0),
+            158 => v(self.sys_getgroups(a[0] as i32 as i64, a[1])),
+            159 => v(self.sys_setgroups(a[0], a[1])),
+            // io_setup, io_destroy, io_submit, io_cancel, io_getevents, io_pgetevents (aio.rs)
+            0 => v(self.sys_io_setup(a[0], a[1])),
+            1 => v(self.sys_io_destroy(a[0])),
+            2 => self.sys_io_submit(a[0], a[1] as i64, a[2]),
+            3 => v(self.sys_io_cancel(a[0], a[1])),
+            4 | 292 => self.sys_io_getevents(a[0], a[1] as i64, a[2] as i64, a[3], a[4]),
+            // preadv2, pwritev2
+            286 | 287 => self.sys_rwv2(nr == 287, &[a[0], a[1], a[2], a[3], a[4], a[5]]),
             // capget: no capabilities
             90 => {
                 if a[1] != 0 {

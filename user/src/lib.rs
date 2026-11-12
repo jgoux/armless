@@ -30,6 +30,7 @@
 // No `unsafe` but in the exports JavaScript calls (`wasm`: raw pointers into the wasm memory)
 #![deny(unsafe_code)]
 
+mod aio;
 mod elf;
 mod exec;
 mod files;
@@ -114,6 +115,9 @@ impl Ctx {
     }
 }
 
+/// The `on_timeout` of a `Wait::Retry` whose call runs again at its deadline.
+pub(crate) const RETRY_AT_DEADLINE: i64 = i64::MIN;
+
 /// What a parked thread waits for.
 #[derive(Clone, Debug)]
 pub(crate) enum Wait {
@@ -123,6 +127,8 @@ pub(crate) enum Wait {
     Sleep,
     /// Anything that may let its call complete (input, a pipe, an eventfd, a close): the call,
     /// rewound to its svc, runs again. At its deadline it returns `on_timeout` instead.
+    /// With `RETRY_AT_DEADLINE` as `on_timeout` the call runs once more at its deadline (with
+    /// `resume_deadline` in the past), for one that gives what it has when its time is up.
     Retry { on_timeout: i64 },
     /// Blobs of the filesystem: the call runs again once they have all arrived
     Blobs(Vec<String>),
@@ -201,6 +207,10 @@ pub(crate) struct Proc {
     /// The executable's path, for /proc/self/exe
     pub exe: Vec<u8>,
     pub sig: Signals,
+    /// Supplementary groups (setgroups)
+    pub groups: Vec<u32>,
+    /// AIO contexts by id (aio.rs)
+    pub aio: BTreeMap<u64, aio::Aio>,
 }
 
 /// A program's process: its threads, memory map, descriptors, terminal and clock. A snapshot
@@ -544,6 +554,8 @@ impl Process {
                 umask: 0o022,
                 exe: exe.to_vec(),
                 sig: Signals::default(),
+                groups: Vec::new(),
+                aio: BTreeMap::new(),
             },
             procs: BTreeMap::new(),
             threads: Vec::new(),
@@ -980,6 +992,10 @@ impl Process {
                     t.ctx.x[0] = 0;
                     t.wait = None;
                 },
+                Wait::Retry { on_timeout } if expired && on_timeout == RETRY_AT_DEADLINE => {
+                    t.resume_deadline = deadline;
+                    t.wait = None;
+                },
                 Wait::Retry { on_timeout } if expired => {
                     // Its call returns rather than run again: past its svc
                     t.ctx.pc += 4;
@@ -1111,6 +1127,15 @@ impl Process {
             w.u(p.umask as u64);
             w.b(&p.exe);
             p.sig.save(&mut w);
+            w.u(p.groups.len() as u64);
+            p.groups.iter().for_each(|&g| w.u(g as u64));
+            w.u(p.aio.len() as u64);
+            for (id, c) in &p.aio {
+                w.u(*id);
+                w.u(c.cap);
+                w.u(c.events.len() as u64);
+                c.events.iter().flatten().for_each(|&x| w.u(x));
+            }
         }
         w.u(self.threads.len() as u64);
         for t in &self.threads {
@@ -1221,6 +1246,19 @@ impl Process {
             let (cwd, umask) = (r.u()?, r.u()? as u32);
             let exe = r.b()?.to_vec();
             let sig = Signals::load(&mut r)?;
+            let mut groups = Vec::new();
+            for _ in 0..r.u()? {
+                groups.push(r.u()? as u32);
+            }
+            let mut aio = BTreeMap::new();
+            for _ in 0..r.u()? {
+                let (id, cap) = (r.u()?, r.u()?);
+                let mut events = std::collections::VecDeque::new();
+                for _ in 0..r.u()? {
+                    events.push_back([r.u()?, r.u()?, r.u()?, r.u()?]);
+                }
+                aio.insert(id, aio::Aio { cap, events });
+            }
             all.insert(
                 pid,
                 Proc {
@@ -1237,6 +1275,8 @@ impl Process {
                     umask,
                     exe,
                     sig,
+                    groups,
+                    aio,
                 },
             );
         }
