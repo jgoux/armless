@@ -240,6 +240,9 @@ pub struct Process {
     pub(crate) fault: Option<String>,
     /// Something changed that parked calls may wait on: they run again
     pub(crate) poked: bool,
+    /// How many times something changed (`poke`): an edge-triggered epoll watch on a descriptor
+    /// still ready is reported again when this has moved since it was last reported
+    pub(crate) epoch: u64,
     /// The thread whose turn it is, and the one whose registers are on the CPU.
     pub(crate) cur: usize,
     pub(crate) loaded: Option<usize>,
@@ -553,6 +556,7 @@ impl Process {
             exit_code: None,
             fault: None,
             poked: false,
+            epoch: 0,
             cur: 0,
             loaded: None,
             resume_deadline: None,
@@ -687,7 +691,13 @@ impl Process {
         for sig in typed.signals {
             self.signal_foreground(sig);
         }
+        self.poke();
+    }
+
+    /// Something changed that parked calls may wait on.
+    pub(crate) fn poke(&mut self) {
         self.poked = true;
+        self.epoch += 1;
     }
 
     /// A signal for the first process from outside it (`kill`: SIGINT for an interrupt the
@@ -700,7 +710,7 @@ impl Process {
     /// The end of the terminal's input: reads past what is left return 0.
     pub fn close_input(&mut self) {
         self.tty.closed = true;
-        self.poked = true;
+        self.poke();
     }
 
     /// The terminal's size changed.
@@ -941,7 +951,10 @@ impl Process {
     /// something changed) the calls that retry.
     fn wake(&mut self) {
         let now = Instant::now();
-        let poked = std::mem::take(&mut self.poked) | self.net_changed();
+        if self.net_changed() {
+            self.poke();
+        }
+        let poked = std::mem::take(&mut self.poked);
         let blobs_in: Vec<bool> = self
             .threads
             .iter()
@@ -1004,6 +1017,36 @@ impl Process {
             }
         }
         woken as i64
+    }
+
+    /// FUTEX_REQUEUE: wakes up to `nwake` threads waiting on `addr`, then moves up to `nrequeue`
+    /// of the rest to wait on `addr2` (a thread keeps its deadline and mask). Returns the number
+    /// of threads woken and the number moved.
+    pub(crate) fn futex_requeue(
+        &mut self,
+        addr: u64,
+        nwake: u64,
+        addr2: u64,
+        nrequeue: u64,
+    ) -> (u64, u64) {
+        let woken = self.futex_wake(addr, nwake, u32::MAX) as u64;
+        let pid = self.p.pid;
+        let mut moved = 0;
+        for t in self.threads.iter_mut() {
+            if moved >= nrequeue {
+                break;
+            }
+            if t.pid != pid {
+                continue;
+            }
+            if let Some((Wait::Futex { addr: a, .. }, _)) = &mut t.wait {
+                if *a == addr {
+                    *a = addr2;
+                    moved += 1;
+                }
+            }
+        }
+        (woken, moved)
     }
 
     /// Takes the registers of the thread on the CPU back into the process, so that every thread
@@ -1287,6 +1330,7 @@ impl Process {
             fault: None,
             // Whatever waited on blobs asks for them again: the host that restores may not have them
             poked: true,
+            epoch: 0,
             cur,
             loaded: None,
             resume_deadline: None,

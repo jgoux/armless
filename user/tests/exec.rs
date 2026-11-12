@@ -1499,7 +1499,7 @@ fn ldr(rt: u32, rn: u32, off: u32) -> u32 {
     0xf940_0000 | (off / 8) << 10 | rn << 5 | rt
 }
 
-/// A machine whose filesystem has these files (name, mode, contents). The contents of those not in
+/// A machine whose filesystem has these files (name, mode, contents: a symlink's target). The contents of those not in
 /// `now` come as blobs when asked for: `run_with_files` gives them.
 fn machine_with(
     files: &[(&str, u32, &[u8])],
@@ -1517,7 +1517,15 @@ fn machine_with(
     let vm = armless::runner::new_vm(config).unwrap().0;
     let entries: Vec<String> = files
         .iter()
-        .map(|(n, mode, data)| format!(r#"["{n}",{},0,{mode},0,0,"{n}-blob"]"#, data.len()))
+        .map(|(n, mode, data)| {
+            // A symlink's contents are its target
+            let target = if mode & 0o170000 == 0o120000 {
+                String::from_utf8_lossy(data).into_owned()
+            } else {
+                format!("{n}-blob")
+            };
+            format!(r#"["{n}",{},0,{mode},0,0,"{target}"]"#, data.len())
+        })
         .collect();
     let json = format!(r#"{{"version":3,"fsroot":[{}]}}"#, entries.join(","));
     vm.board.load_filesystem(json.as_bytes()).unwrap();
@@ -1921,4 +1929,138 @@ fn the_program_headers_and_the_loaders_path_are_read_from_wherever_they_are_in_t
     let (out, status, _) = run_serving(&mut p, &mut vm);
     assert_eq!(out, b"hello\r\n", "the loader the far PT_INTERP names ran");
     assert!(matches!(status, Status::Exited(3)), "{status:?}");
+}
+
+const LINK: u32 = 0o120777;
+
+#[test]
+fn a_symlink_to_a_device_opens_the_device_as_the_images_log_files_do() {
+    // nginx opens /var/log/nginx/error.log, a link to /dev/stderr, to append to it; the device
+    // is not in the filesystem, the terminal is what it names
+    let mut a = Asm::with_texts(vec![("log", b"log"), ("chain", b"chain")]);
+    a.room().room(); // 128 bytes: a struct stat
+    for (path, fd, text) in [("log", 3, "H"), ("chain", 4, "R")] {
+        a.i(0x9280_0c60) // AT_FDCWD
+            .adr(1, path)
+            .movz(2, 0x441) // O_WRONLY | O_CREAT | O_APPEND
+            .movz(3, 0o644)
+            .svc(56)
+            .cmp_imm(0, fd)
+            .bcond(COND_NE, "fail")
+            .movz(0, fd as u16)
+            .adr(1, text)
+            .movz(2, 1)
+            .svc(64)
+            .cmp_imm(0, 1)
+            .bcond(COND_NE, "fail");
+    }
+    // fstatat(AT_FDCWD, "chain", &st, 0): a character device, though the link is a file
+    a.i(0x9280_0c60)
+        .adr(1, "chain")
+        .i(0x9100_03e2)
+        .movz(3, 0)
+        .svc(79);
+    a.cbnz_fail(0);
+    a.i(0xb940_13e9) // ldr w9, [sp, #16]: st_mode
+        .i(0x1214_0d29) // and w9, w9, #0xf000
+        .i(0x530c_7d29) // lsr w9, w9, #12
+        .cmp_imm(9, 2) // S_IFCHR
+        .bcond(COND_NE, "fail");
+    a.ends();
+    let prog = a.elf();
+    let files: [(&str, u32, &[u8]); 3] = [
+        ("prog", EXE, &prog),
+        ("log", LINK, b"/dev/stderr"),
+        ("chain", LINK, b"log"),
+    ];
+    let mut vm = machine_with(&files, &["prog"]);
+    let mut p = exec_prog(&mut vm);
+    let (out, status, _) = run_with_files(&mut p, &mut vm, &files);
+    assert_eq!(out, b"HRA");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+const CLONE_SIGHAND: u32 = 0x800;
+const CLONE_THREAD: u32 = 0x10000;
+
+impl Asm {
+    /// A thread that waits on the futex word at x19 + `at` and, when woken, prints "B" and ends
+    /// alone: it goes on at the label "waiter", which each call that follows `spawn_waiter` can
+    /// reuse with its own address in x20
+    fn spawn_waiter(&mut self, at: u32) -> &mut Self {
+        self.i(add_imm(20, 19, at, false))
+            .clone(CLONE_VM | CLONE_SIGHAND | CLONE_THREAD)
+            .cbz_to(0, "waiter")
+    }
+    /// The thread's body: futex(x20, FUTEX_WAIT, 0, NULL), print "B", exit(0)
+    fn waiter(&mut self) -> &mut Self {
+        self.label("waiter")
+            .i(mov(0, 20))
+            .movz(1, 0)
+            .movz(2, 0)
+            .movz(3, 0)
+            .svc(98)
+            .print("B", 1)
+            .movz(0, 0)
+            .svc(93)
+    }
+    /// futex(x19 + `at`, op, val, val2, x19 + `at2`, val3) into x0
+    fn futex(&mut self, at: u32, op: u16, val: u32, val2: u32, at2: u32, val3: u32) -> &mut Self {
+        self.i(add_imm(0, 19, at, false))
+            .movz(1, op)
+            .mov32(2, val)
+            .mov32(3, val2)
+            .i(add_imm(4, 19, at2, false))
+            .mov32(5, val3)
+            .svc(98)
+    }
+}
+
+fn run_threads(a: &mut Asm) {
+    let (mut vm, mut p) = start(&a.elf());
+    let (out, status) = run(&mut p, &mut vm.cpus[0]);
+    assert_eq!(out, b"BBA", "{status:?}");
+    assert!(matches!(status, Status::Exited(0)), "{status:?}");
+}
+
+#[test]
+fn a_futex_requeue_moves_waiters_to_another_word_and_wakes_the_rest_there() {
+    // FUTEX_CMP_REQUEUE: of two waiters on the first word, one wakes and one moves to the
+    // second; waking the first word finds nobody, waking the second finds the one it got
+    let mut a = Asm::default();
+    a.room().mmap_anon(PROT_READ | PROT_WRITE);
+    a.spawn_waiter(0).spawn_waiter(0);
+    a.movz(0, 0).svc(124); // sched_yield: both threads run to their waits
+    a.futex(0, 4, 1, 0x7fff_ffff, 8, 0) // wake 1, requeue all the rest
+        .cmp_imm(0, 2)
+        .bcond(COND_NE, "fail");
+    a.futex(0, 4, 1, 0, 8, 1) // the word is not 1: EAGAIN, nothing moves or wakes
+        .cmn_imm(0, 11)
+        .bcond(COND_NE, "fail");
+    a.movz(0, 0).svc(124); // the woken thread prints "B"
+    a.futex(0, 1, 10, 0, 0, 0) // nobody waits on the first word any more
+        .cbnz_fail(0);
+    a.futex(8, 1, 10, 0, 0, 0) // one waits on the second
+        .cmp_imm(0, 1)
+        .bcond(COND_NE, "fail");
+    a.movz(0, 0).svc(124).ends();
+    a.waiter();
+    run_threads(&mut a);
+}
+
+#[test]
+fn a_futex_wake_op_changes_a_word_and_wakes_by_its_old_value() {
+    // FUTEX_WAKE_OP (word2 += 1, wake word2's waiter if its old value was 0): one waiter on
+    // each word, both wake, and the second word holds 1
+    let mut a = Asm::default();
+    a.room().mmap_anon(PROT_READ | PROT_WRITE);
+    a.spawn_waiter(0).spawn_waiter(8);
+    a.movz(0, 0).svc(124);
+    a.futex(0, 5, 1, 1, 8, 0x1000_1000) // op ADD 1, cmp EQ 0
+        .cmp_imm(0, 2)
+        .bcond(COND_NE, "fail");
+    a.ldr_w(22, 19, 8).cmp_imm(22, 1).bcond(COND_NE, "fail");
+    a.movz(0, 0).svc(124).movz(0, 0).svc(124).ends();
+    a.waiter();
+    run_threads(&mut a);
 }

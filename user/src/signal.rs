@@ -394,7 +394,7 @@ impl Process {
         }
         self.sig_dirty = true;
         // rt_sigtimedwait looks again
-        self.poked = true;
+        self.poke();
     }
 
     /// The signal an instruction of the current thread raises itself (`code`: why), when the

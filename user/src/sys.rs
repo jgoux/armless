@@ -35,6 +35,48 @@ const NCPUS_REPORTED: u64 = 4;
 type Ready = (bool, bool, bool);
 
 impl Process {
+    /// FUTEX_WAKE_OP: applies the operation `enc` (the kernel's encoded `op`, `oparg`, `cmp` and
+    /// `cmparg`) to the word at `addr2`, wakes up to `nwake` threads waiting on `addr`, and, if
+    /// the old value of the word satisfies the comparison, up to `nwake2` waiting on `addr2`.
+    fn futex_wake_op(&mut self, addr: u64, nwake: u64, addr2: u64, nwake2: u64, enc: u32) -> i64 {
+        let sign = |v: u32| ((v << 20) as i32) >> 20;
+        let (mut op, cmp) = ((enc >> 28) & 0xf, (enc >> 24) & 0xf);
+        let (mut oparg, cmparg) = (sign((enc >> 12) & 0xfff), sign(enc & 0xfff));
+        if op & 8 != 0 {
+            op &= 7;
+            oparg = 1i32.wrapping_shl(oparg as u32 & 31);
+        }
+        let Some(old) = self.u32_at(addr2) else {
+            return -EFAULT;
+        };
+        let old = old as i32;
+        let new = match op {
+            0 => oparg,
+            1 => old.wrapping_add(oparg),
+            2 => old | oparg,
+            3 => old & !oparg,
+            4 => old ^ oparg,
+            _ => return -ENOSYS,
+        };
+        let hit = match cmp {
+            0 => old == cmparg,
+            1 => old != cmparg,
+            2 => old < cmparg,
+            3 => old <= cmparg,
+            4 => old > cmparg,
+            5 => old >= cmparg,
+            _ => return -ENOSYS,
+        };
+        if !self.put_u32(addr2, new as u32) {
+            return -EFAULT;
+        }
+        let mut woken = self.futex_wake(addr, nwake, u32::MAX);
+        if hit {
+            woken += self.futex_wake(addr2, nwake2, u32::MAX);
+        }
+        woken
+    }
+
     // ------------------------------------------------------------ descriptors
 
     fn ready(&self, fd: i32) -> Option<Ready> {
@@ -158,7 +200,7 @@ impl Process {
                 }
                 let n = pipe.buf.len().min(max);
                 let out = pipe.buf.drain(..n).collect();
-                self.poked = true;
+                self.poke();
                 Ok(out)
             },
             Kind::Event { count } => {
@@ -182,7 +224,7 @@ impl Process {
                 {
                     *count = 0;
                 }
-                self.poked = true;
+                self.poke();
                 Ok(count.to_le_bytes().to_vec())
             },
             Kind::Sock(id) => {
@@ -259,7 +301,7 @@ impl Process {
                 }
                 let n = room.min(data.len());
                 pipe.buf.extend(&data[..n]);
-                self.poked = true;
+                self.poke();
                 Ok(n)
             },
             Kind::Event { .. } => {
@@ -274,7 +316,7 @@ impl Process {
                 {
                     *count += add;
                 }
-                self.poked = true;
+                self.poke();
                 Ok(8)
             },
             Kind::Sock(id) => {
@@ -301,7 +343,7 @@ impl Process {
                 if let Some(ino) = ino {
                     self.fs(|fs| fs.drop_ref(ino));
                 }
-                self.poked = true;
+                self.poke();
                 true
             },
         }
@@ -351,6 +393,16 @@ impl Process {
         })
     }
 
+    /// Where a symlink in the filesystem sends `path` when its target is a device or a /proc file
+    fn special_target(&self, start: Ino, path: &[u8]) -> Option<Vec<u8>> {
+        self.fs(|fs| {
+            files::link_to_special(fs, start, path, |p| {
+                device(p).is_some() || self.proc_file(p).is_some()
+            })
+        })
+        .flatten()
+    }
+
     fn openat(&mut self, dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Ret {
         let cloexec = flags & O_CLOEXEC != 0;
         let status = flags & (O_ACCMODE | O_APPEND | O_NONBLOCK);
@@ -378,6 +430,11 @@ impl Process {
             Ok(s) => s,
             Err(e) => return Ret::Val(e),
         };
+        if flags & O_NOFOLLOW == 0 {
+            if let Some(target) = self.special_target(start, path) {
+                return self.openat(AT_FDCWD, &target, flags & !(O_CREAT | O_EXCL), mode);
+            }
+        }
         let (now, umask) = (self.now_secs(), self.p.umask);
         let opened = self.fs(|fs| -> Result<Ino, i64> {
             let ino = if flags & O_CREAT != 0 {
@@ -462,6 +519,12 @@ impl Process {
         }
         if path == b"/proc" || path == b"/proc/self" || path == b"/dev" {
             return Ok(Stat::device(S_IFDIR | 0o555, 0));
+        }
+        if flags & AT_SYMLINK_NOFOLLOW == 0 {
+            let start = self.start_dir(dirfd)?;
+            if let Some(target) = self.special_target(start, path) {
+                return self.stat_path(AT_FDCWD, &target, flags);
+            }
         }
         let ino = self.lookup(dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
         self.fs(|fs| Stat::of(fs, ino)).flatten().ok_or(-ENOENT)
@@ -598,6 +661,7 @@ impl Process {
         else {
             return Vec::new();
         };
+        let epoch = self.epoch;
         let mut now: Vec<(i32, u32)> = Vec::new();
         for (&fd, w) in watch {
             let Some((r, wr, hup)) = self.ready(fd) else {
@@ -625,11 +689,18 @@ impl Process {
         let mut ready = Vec::new();
         for (fd, got) in now {
             let w = watch.get_mut(&fd).unwrap();
-            // Edge-triggered: only what it became ready for since it was last reported
-            let report = if w.events & EPOLLET != 0 { got & !w.last } else { got };
+            // Edge-triggered: what it became ready for since it was last reported, and more input
+            // in a descriptor that was never drained (a write to an eventfd that nobody reads is
+            // an edge each time, as the kernel counts every wakeup of the file)
+            let report = if w.events & EPOLLET != 0 {
+                got & !w.last | if w.epoch != epoch { got & 1 } else { 0 }
+            } else {
+                got
+            };
             if take {
                 // What it is no longer ready for may be reported again once it is
                 w.last &= got;
+                w.epoch = epoch;
             }
             if report == 0 || w.events & 0x3fff == 0 || ready.len() >= max {
                 continue;
@@ -1178,6 +1249,7 @@ impl Process {
                                 events: ev,
                                 data,
                                 last: 0,
+                                epoch: self.epoch,
                             },
                         );
                     },
@@ -1282,6 +1354,16 @@ impl Process {
                     },
                     1 => v(self.futex_wake(addr, val, u32::MAX)),
                     10 => v(self.futex_wake(addr, val, a[5] as u32)),
+                    // FUTEX_REQUEUE and FUTEX_CMP_REQUEUE (a[5] is the value to compare with):
+                    // musl's condition variables broadcast with them.
+                    3 | 4 => {
+                        if op & 0x7f == 4 && self.u32_at(addr) != Some(a[5] as u32) {
+                            return v(-EAGAIN);
+                        }
+                        let (woken, moved) = self.futex_requeue(addr, val, a[4], a[3]);
+                        v((woken + moved) as i64)
+                    },
+                    5 => v(self.futex_wake_op(addr, val, a[4], a[3], a[5] as u32)),
                     _ => v(-ENOSYS),
                 }
             },
@@ -1484,7 +1566,7 @@ impl Process {
                         crate::tty::Termios::from_bytes(&b.try_into().unwrap()),
                         req == 0x5404,
                     );
-                    self.poked = true;
+                    self.poke();
                     v(0)
                 },
                 None => v(-EFAULT),
