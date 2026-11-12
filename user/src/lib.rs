@@ -9,8 +9,9 @@
 //! device serves a Linux guest), a terminal (termios, the window size, a line discipline), pipes,
 //! sockets (net.rs: AF_UNIX, and TCP and UDP on the loopback in memory, a network at the host for
 //! the rest), threads (clone, futexes), processes (fork, vfork, execve, wait4, kill: proc.rs,
-//! exec.rs), epoll, poll and select, clocks and sleeps. Blocking calls park their thread and run
-//! again when something changes, so a snapshot can be taken whatever it waits on.
+//! exec.rs), epoll, poll and select, clocks, sleeps and timers (timer.rs). Blocking calls park
+//! their thread and run again when something changes, so a snapshot can be taken whatever it
+//! waits on.
 //!
 //! Signals are delivered as Linux delivers them (`signal`): handlers on the frame the kernel
 //! builds, masks, alternate stacks, blocking calls interrupted (EINTR, or restarted with
@@ -41,6 +42,7 @@ mod proc;
 mod ser;
 mod signal;
 mod sys;
+mod timer;
 mod tty;
 #[cfg(any(target_arch = "wasm32", feature = "wasm-api"))]
 #[allow(unsafe_code)]
@@ -61,6 +63,7 @@ use files::Files;
 use host::Instant;
 use ser::{R, W};
 use signal::{Signals, ThreadSig};
+use timer::Timers;
 use tty::Tty;
 
 pub(crate) const PAGE: u64 = 4096;
@@ -258,6 +261,8 @@ pub struct Process {
     pub(crate) loaded: Option<usize>,
     /// The deadline the current call had when it was last parked (Thread::resume_deadline)
     pub(crate) resume_deadline: Option<Instant>,
+    /// The interval and POSIX timers, and the CPU time they count (timer.rs)
+    pub(crate) timers: Timers,
     /// Print every syscall to stderr.
     pub trace: bool,
     pub stats: Stats,
@@ -418,7 +423,13 @@ impl Process {
     pub(crate) fn now_ns(&self, clock: u64) -> u64 {
         match clock {
             // CLOCK_REALTIME, CLOCK_REALTIME_COARSE
-            0 | 5 => host::wall_ns(),
+            0 | 5 | 11 => host::wall_ns(),
+            // CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID: the host time they held the CPU
+            2 => self.timers.proc_cpu_ns(self.p.pid),
+            3 => self
+                .threads
+                .get(self.cur)
+                .map_or(0, |t| self.timers.thread_cpu_ns(t.tid)),
             // Monotonic: from a second before the program started, on across snapshots
             _ => self.mono_base + self.start.elapsed().as_nanos() as u64,
         }
@@ -573,6 +584,7 @@ impl Process {
             cur: 0,
             loaded: None,
             resume_deadline: None,
+            timers: Timers::default(),
             trace: false,
             stats: Stats::default(),
         };
@@ -797,6 +809,7 @@ impl Process {
     pub fn run<H: Host>(&mut self, cpu: &mut Cpu<H>, budget: Duration) -> Status {
         let until = Instant::now() + budget;
         'run: loop {
+            self.charge_cpu();
             if let Some(c) = self.exit_code {
                 self.net_exit();
                 return Status::Exited(c);
@@ -807,7 +820,9 @@ impl Process {
             if Instant::now() >= until {
                 return Status::Running;
             }
-            // Signals first: a call a handler interrupts ends rather than runs again
+            // Timers that are due signal first; then signals: a call a handler interrupts ends
+            // rather than runs again
+            self.fire_timers();
             self.deliver_signals(cpu);
             if self.exit_code.is_some() || self.fault.is_some() {
                 continue;
@@ -829,10 +844,12 @@ impl Process {
                     self.exit_code = Some(0);
                     continue;
                 }
+                // (A timer that is armed wakes the machine too)
                 return Status::Idle(
                     self.threads
                         .iter()
                         .filter_map(|t| t.wait.as_ref().and_then(|(_, d)| *d))
+                        .chain(self.timer_wake())
                         .min(),
                 );
             };
@@ -847,6 +864,7 @@ impl Process {
             let pid = self.threads[next].pid;
             self.switch_to(pid);
             self.sync_mmu(cpu);
+            self.begin_slice(pid, self.threads[next].tid);
 
             // Run it until it blocks, faults, or its slice ends: syscalls answered on the way
             // count against the slice, so a thread that polls the clock cannot keep the CPU.
@@ -1190,6 +1208,8 @@ impl Process {
             w.u(left(t.resume_deadline));
             t.sig.save(&mut w);
         }
+        // The timers (a state from before them ends here)
+        self.timers.save(&mut w, now);
         w.0
     }
 
@@ -1345,6 +1365,7 @@ impl Process {
                 sig: ThreadSig::load(&mut r)?,
             });
         }
+        let timers = if r.0.is_empty() { Timers::default() } else { Timers::load(&mut r, now)? };
         // The first process is the one that runs
         let mut first = all.remove(&INIT).ok_or("no first process")?;
         files.fds = std::mem::take(&mut first.fds);
@@ -1375,6 +1396,7 @@ impl Process {
             cur,
             loaded: None,
             resume_deadline: None,
+            timers,
             trace: false,
             stats: Stats::default(),
         };
