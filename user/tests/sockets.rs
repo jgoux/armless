@@ -435,6 +435,51 @@ fn nonblocking_sockets_fail_with_eagain_and_report_readiness() {
 }
 
 #[test]
+fn a_socket_takes_async_io_and_an_owner_though_no_sigio_comes() {
+    // nginx makes the channel between its processes asynchronous and owned before it forks a
+    // worker, and a failure of either ends the master
+    let mut vm = machine();
+    let mut p = Prog::default();
+    p.put(0x300, &1u32.to_le_bytes());
+    p.sys(199, &[I(1), I(1), I(0), D(0x100)]).expect(0); // fds 3 and 4
+    p.sys(29, &[W(0x100), I(0x5452), D(0x300)]).expect(0); // ioctl(FIOASYNC) on
+    p.sys(25, &[W(0x100), I(8), I(1)]).expect(0); // F_SETOWN
+    p.sys(25, &[W(0x100), I(3), I(0)]).save(0x110); // F_GETFL
+    p.out(0x110, 2);
+    p.sys(29, &[W(0x100), I(0x5452), D(0x304)]).expect(0); // off
+    p.sys(25, &[W(0x100), I(3), I(0)]).save(0x110);
+    p.out(0x110, 2);
+    let mut p = start(&mut vm, p);
+    let (out, status) = run(&mut p, &mut vm);
+    ok(&status);
+    assert_eq!(out, [2, 0x20, 2, 0], "O_RDWR, with O_ASYNC while it is on");
+}
+
+#[test]
+fn gettimeofday_gives_the_wall_clock_in_microseconds_and_a_zero_timezone() {
+    // V8's Date.now() is gettimeofday, and when it fails the date is whatever was in the stack
+    let mut vm = machine();
+    let mut p = Prog::default();
+    p.put(0x120, &[0xff; 8]);
+    p.sys(169, &[D(0x100), D(0x120)]).expect(0);
+    p.out(0x100, 16);
+    p.out(0x120, 8);
+    p.sys(169, &[I(0), I(0)]).expect(0);
+    let mut p = start(&mut vm, p);
+    let (out, status) = run(&mut p, &mut vm);
+    ok(&status);
+    let sec = u64::from_le_bytes(out[..8].try_into().unwrap());
+    let usec = u64::from_le_bytes(out[8..16].try_into().unwrap());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(sec.abs_diff(now) <= 5, "{sec} is not near {now}");
+    assert!(usec < 1_000_000, "{usec}");
+    assert_eq!(out[16..], [0; 8], "the timezone is zero");
+}
+
+#[test]
 fn an_edge_triggered_watch_reports_each_write_to_an_eventfd_that_nobody_reads() {
     let mut vm = machine();
     let mut p = Prog::default();

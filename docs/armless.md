@@ -233,7 +233,8 @@ x0–x5, answers it in x0, and resumes at ELR.
   `getsockname`, `getpeername`, `getsockopt` and `setsockopt`; a socket is a descriptor like a
   pipe's, and read, write, readv, writev, fcntl, poll, select and epoll take it. Blocking and
   non-blocking (`SOCK_NONBLOCK`, `EAGAIN`, `EINPROGRESS`) as for pipes: a call that can't finish
-  parks its thread and runs again when something changed.
+  parks its thread and runs again when something changed. `FIOASYNC` (`O_ASYNC`) and `F_SETOWN`
+  are accepted, and SIGIO is never sent.
   - *In memory:* AF_UNIX stream and datagram sockets (paths, which are entries of the
     filesystem, and abstract names, and `socketpair`), and AF_INET and AF_INET6 TCP and UDP to
     the loopback (127/8, `::1`, the machine's own address, an unspecified one), through a table of
@@ -315,7 +316,7 @@ x0–x5, answers it in x0, and resumes at ELR.
 - **Blocking:** a call that can't complete (a read of the terminal or a pipe, a poll, a wait
   for blobs) parks its thread with its pc on the svc, and runs again when something changes,
   or returns at its deadline. So whatever a program waits on, a snapshot can be taken.
-- **Clocks:** `clock_gettime`, `nanosleep`, `clock_nanosleep`. The monotonic clock goes on
+- **Clocks:** `clock_gettime`, `gettimeofday`, `nanosleep`, `clock_nanosleep`. The monotonic clock goes on
   across a snapshot and its restores.
 - **Signals** (signal.rs): actions per process, a mask, a pending set and an alternate stack
   per thread, a pending set for the process (given to its first thread that doesn't block the
