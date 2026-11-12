@@ -4,11 +4,14 @@
 #   build    armless-exec, native, its default build (the native JIT is compiled in and stays off), on an arm runner
 #   package  per image: the Dockerfile built as linux/arm64 (the arm runner: no emulation), `docker save`d, flattened into armless's filesystem
 #            (fs.json + blobs/, made with the tools of tests/fs of the tree under test) with its launch config
-#   cell     per image: harness.py starts the image under armless-exec, probes it from the host, applies the serve checks, and on a failure
-#            runs it again with the system call trace to classify the first failure
+#   cell     per image: harness.py starts the image under armless-exec (--net and the publish flags of the image, from the gate's config), probes it from
+#            the host and applies the gates' serve checks (exact status, content type and body; for the hook runtimes POST /ready, /run, /terminate within the
+#            drain limit), samples the peak PSS of the process tree; then starts it again with the system call trace, always, and lists every call that returned
+#            ENOSYS or EOPNOTSUPP (and the guest's own messages saying so)
 #   report   the table (job summary and artifact user-images-summary) and the per-image evidence (artifacts cell-<image>)
 # Images, Dockerfiles and checks are supa-wasm's (experiments/usermode/gates/m2a, m2b, m3b, m4a and compute/ at um/int), copied under .github/user-images/.
 # A cell fails only when the harness itself fails; an image that does not serve is a row of the table, not a red job.
+# `exec_args` is for options beyond the basics (the harness already passes --net and --publish for the image's ports).
 #
 # Dispatch (the `ref` input is the list: comma-separated, merged in order; a ref is a branch, tag or sha of this fork, or `upstream:<ref>`):
 #   gh workflow run user-images.yml -R jgoux/armless --ref ci/user-images -f ref=main
@@ -22,7 +25,7 @@ on:
         description: "armless ref(s), comma-separated, merged in order (branch/tag/sha of this fork, or upstream:<ref>)"
         default: main
       exec_args:
-        description: "extra armless-exec options, space-separated (e.g. a flag a ref adds to reach the guest's ports)"
+        description: "extra armless-exec options, space-separated, beyond --net and the --publish flags the harness adds (e.g. a flag a ref adds)"
         default: ""
       ready_timeout:
         description: "seconds an image gets to become ready"
@@ -172,7 +175,7 @@ jobs:
       matrix:
         image: [go, node, nginx, python, shell, deno, node-runtime]
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4

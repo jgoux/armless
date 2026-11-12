@@ -1,4 +1,4 @@
 # The armless refs the user-images workflow runs on a push to this branch (a dispatch takes its own `ref` input).
 # One line: refs separated by commas, merged in order onto the first. A ref is a branch, tag or sha of this fork, or
 # `upstream:<branch|tag|sha|refs/pull/N/head>` for filipecabaco/armless.
-main
+upstream:armless-v0.14.0
