@@ -139,7 +139,67 @@ mod imp {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
+    use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
+    use std::cell::Cell;
     use std::io::Read;
+
+    /// Bytes decompressed before each call of the sink of `decompress_each`, at most.
+    const EACH: usize = 128 << 10;
+
+    /// The largest frame content size (from the frame header, which the data may lie about) that
+    /// `decompress` reserves the output for in one go.
+    const PRESIZE_MAX: u64 = 1 << 30;
+
+    /// What a thread decodes with, kept between calls: ruzstd allocates its big buffers (the window,
+    /// the block and literals scratch) once per `FrameDecoder` and only resets them for the next
+    /// frame, so one decoder per thread allocates them once for all the frames the thread decodes.
+    struct Scratch {
+        dec: FrameDecoder,
+        /// `dec` has been through `init` once: its window is allocated at the size of a frame, in
+        /// one go (a new decoder's grows by doubling, copying, while it decodes)
+        primed: bool,
+        /// The pieces of `decompress_each`
+        piece: Vec<u8>,
+    }
+
+    thread_local! {
+        static SCRATCH: Cell<Option<Box<Scratch>>> = const { Cell::new(None) };
+    }
+
+    /// `f` with this thread's decoder. A call made from within `f` (a sink that decompresses) gets a
+    /// decoder of its own, and the last one back is the one kept.
+    fn with_scratch<T>(f: impl FnOnce(&mut Scratch) -> T) -> T {
+        let mut s = SCRATCH
+            .try_with(Cell::take)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                Box::new(Scratch {
+                    dec: FrameDecoder::new(),
+                    primed: false,
+                    piece: vec![0u8; EACH],
+                })
+            });
+        let r = f(&mut s);
+        let _ = SCRATCH.try_with(|c| c.set(Some(s)));
+        r
+    }
+
+    /// The decoder of the frame at the start of `rest`, which it reads the header of.
+    fn open<'a, 'b>(
+        dec: &'a mut FrameDecoder,
+        primed: &mut bool,
+        rest: &'a mut &'b [u8],
+    ) -> Option<StreamingDecoder<&'a mut &'b [u8], &'a mut FrameDecoder>> {
+        if !*primed {
+            // The first `init` of a decoder makes its state, the next ones (`reset`) reserve the
+            // window up front
+            let mut header: &[u8] = rest;
+            dec.init(&mut header).ok()?;
+            *primed = true;
+        }
+        StreamingDecoder::new_with_decoder(rest, dec).ok()
+    }
 
     /// Every frame of `data`, decompressed.
     pub fn decompress(data: &[u8]) -> Option<Vec<u8>> {
@@ -148,12 +208,25 @@ mod imp {
         };
         use std::sync::atomic::Ordering::Relaxed;
         let _time = Timed::start(&ZSTD_NS);
-        let mut out = Vec::new();
-        let mut rest = data;
-        while !rest.is_empty() {
-            let mut d = ruzstd::decoding::StreamingDecoder::new(&mut rest).ok()?;
-            d.read_to_end(&mut out).ok()?;
-        }
+        let out = with_scratch(|s| {
+            let mut out = Vec::new();
+            let mut rest = data;
+            while !rest.is_empty() {
+                let mut d = open(&mut s.dec, &mut s.primed, &mut rest)?;
+                // The size the frame says it has (0 if it does not say): the output is allocated at
+                // that size, once (for the first frame; the next ones grow it as `reserve` does)
+                let size = d.decoder.content_size();
+                if (1..=PRESIZE_MAX).contains(&size) {
+                    if out.is_empty() {
+                        out.reserve_exact(size as usize);
+                    } else {
+                        out.reserve(size as usize);
+                    }
+                }
+                d.read_to_end(&mut out).ok()?;
+            }
+            Some(out)
+        })?;
         // What the caller gets: its size, and what was allocated for it (read_to_end's growth leaves slack)
         ZSTD_CALLS.fetch_add(1, Relaxed);
         ZSTD_IN_BYTES.fetch_add(data.len() as u64, Relaxed);
@@ -172,28 +245,26 @@ mod imp {
         Stopped,
     }
 
-    /// Bytes decompressed before each call of the sink of `decompress_each`, at most.
-    const EACH: usize = 128 << 10;
-
     /// Every frame of `data`, decompressed, given to `sink` in pieces of at most `EACH` bytes: the
     /// decompressed contents are never all in memory (as `decompress` has them).
     pub fn decompress_each(data: &[u8], sink: &mut dyn FnMut(&[u8]) -> bool) -> Ended {
-        let mut buf = vec![0u8; EACH];
-        let mut rest = data;
-        while !rest.is_empty() {
-            let Ok(mut d) = ruzstd::decoding::StreamingDecoder::new(&mut rest) else {
-                return Ended::Corrupt;
-            };
-            loop {
-                match d.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) if sink(&buf[..n]) => {},
-                    Ok(_) => return Ended::Stopped,
-                    Err(_) => return Ended::Corrupt,
+        with_scratch(|s| {
+            let mut rest = data;
+            while !rest.is_empty() {
+                let Some(mut d) = open(&mut s.dec, &mut s.primed, &mut rest) else {
+                    return Ended::Corrupt;
+                };
+                loop {
+                    match d.read(&mut s.piece) {
+                        Ok(0) => break,
+                        Ok(n) if sink(&s.piece[..n]) => {},
+                        Ok(_) => return Ended::Stopped,
+                        Err(_) => return Ended::Corrupt,
+                    }
                 }
             }
-        }
-        Ended::Done
+            Ended::Done
+        })
     }
 
     /// Native stand-in for the wasm streaming decoder: each `feed` must hold
