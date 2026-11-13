@@ -983,6 +983,15 @@ pub(crate) enum Miss {
     Io,
 }
 
+/// The page cache's key for the page at `page` of the area at `start`, a MAP_PRIVATE file's, when
+/// its file is at version `gen`: the file, the version, the offset of the page in it and how many
+/// of its bytes come from it (none: nothing to cache).
+fn cache_key(page: u64, start: u64, vma: &Vma, gen: u64) -> Option<(Ino, u64, u64, u32)> {
+    let b = vma.file.filter(|_| !vma.shared)?;
+    let n = b.data_end.min(page + PAGE).saturating_sub(page);
+    (n > 0).then(|| (b.ino, gen, b.off + (page - start), n as u32))
+}
+
 impl Process {
     /// Takes a reference to a file, or gives one back, for the areas that changed.
     pub(crate) fn settle(&self) {
@@ -1020,7 +1029,7 @@ impl Process {
         }
         let pa = desc & ADDR;
         if desc & 1 == 0 {
-            return self.populate(page, start, &vma);
+            return self.populate(page, start, &vma, acc);
         }
         let write = matches!(acc, Acc::Write | Acc::Force);
         if !write || writable(desc) {
@@ -1031,14 +1040,18 @@ impl Process {
         }
         self.unshare(
             page,
+            start,
             pa,
             &vma,
             acc == Acc::Force && vma.prot & PROT_WRITE == 0,
         )
     }
 
-    /// A frame for the page at `page` of the area at `start`: its file's bytes, or zeros.
-    fn populate(&self, page: u64, start: u64, vma: &Vma) -> Result<u64, Miss> {
+    /// A frame for the page at `page` of the area at `start`: its file's bytes, or zeros. A read
+    /// of a MAP_PRIVATE file's page takes the page cache's frame for those bytes if it has one (or
+    /// puts the one it fills there), mapped read-only: the first write to it copies it. A write
+    /// (`acc`) gets a frame of its own, as does everything else.
+    fn populate(&self, page: u64, start: u64, vma: &Vma, acc: Acc) -> Result<u64, Miss> {
         // A file mapped MAP_SHARED: the one frame every mapping of that page of it has (Postgres's
         // dynamic shared memory is files in pg_dynshmem that its processes map)
         let key = vma
@@ -1064,19 +1077,54 @@ impl Process {
                 return Ok(pa);
             }
         }
+        let cacheable = matches!(acc, Acc::Read | Acc::Exec) && !vma.shared;
+        if let Some(b) = vma.file.filter(|_| cacheable) {
+            let gen = self.fs(|fs| fs.data_gen(b.ino)).flatten();
+            let have = gen
+                .and_then(|g| cache_key(page, start, vma, g))
+                .and_then(|k| self.page_cache.borrow().get(&k).copied());
+            if let Some(pa) = have {
+                let counted = page < page_up(b.data_end);
+                {
+                    let mut mm = self.p.mm.borrow_mut();
+                    let mut f = self.frames.borrow_mut();
+                    if !mm.set(&mut f, page, pa | bits(vma.prot, false)) {
+                        return Err(Miss::Oom);
+                    }
+                    f.incref(pa);
+                    if counted {
+                        mm.lazy_less(b.ino, 1);
+                    }
+                }
+                memstats::PAGE_CACHE_HITS.fetch_add(1, Relaxed);
+                self.settle();
+                return Ok(pa);
+            }
+        }
         let mut data = Vec::new();
         let mut counted = false;
+        // Where the page goes in the page cache, if this read is the one that puts it there
+        let mut cache = None;
         if let Some(b) = vma.file {
             let n = b.data_end.min(page + PAGE).saturating_sub(page);
             counted = page < page_up(b.data_end);
             if n > 0 {
                 let off = b.off + (page - start);
-                match self.fs(|fs| got(fs.read(b.ino, off, n as usize))) {
-                    Some(Got::Ok(d)) => data = d,
-                    Some(Got::Need(blobs)) => return Err(Miss::Need(blobs)),
-                    Some(Got::Err(e)) if e == -(EIO as i64) => return Err(Miss::Io),
+                // The version of the file is taken with the bytes, in one go
+                let read = self.fs(|fs| {
+                    (fs.data_gen(b.ino), got(fs.read(b.ino, off, n as usize)))
+                });
+                match read {
+                    Some((gen, Got::Ok(d))) => {
+                        data = d;
+                        cache = gen
+                            .filter(|_| cacheable)
+                            .and_then(|g| cache_key(page, start, vma, g));
+                    },
+                    Some((_, Got::Need(blobs))) => return Err(Miss::Need(blobs)),
+                    Some((_, Got::Err(e))) if e == -(EIO as i64) => return Err(Miss::Io),
                     // A file that is gone, or fails otherwise, reads as zeros
-                    Some(Got::Err(_)) | None => {},
+                    Some((_, Got::Err(_))) | None => {},
                 }
             }
         }
@@ -1091,7 +1139,8 @@ impl Process {
                 memstats::POPULATE_FAULTS.fetch_add(1, Relaxed);
                 memstats::POPULATE_BYTES.fetch_add(data.len() as u64, Relaxed);
             }
-            if !mm.set(&mut f, page, pa | bits(vma.prot, true)) {
+            let cached = cache.filter(|_| !data.is_empty());
+            if !mm.set(&mut f, page, pa | bits(vma.prot, cached.is_none())) {
                 f.decref(pa);
                 return Err(Miss::Oom);
             }
@@ -1104,6 +1153,15 @@ impl Process {
                 f.incref(pa);
                 self.file_pages.borrow_mut().insert(key, pa);
             }
+            if let Some(key) = cached {
+                // The page cache's hold on it, for the next mapping of these bytes
+                f.incref(pa);
+                let mut table = self.page_cache.borrow_mut();
+                if let Some(old) = table.insert(key, pa) {
+                    f.decref(old);
+                }
+                memstats::PAGE_CACHE_ENTRIES.fetch_max(table.len() as u64, Relaxed);
+            }
             pa
         };
         self.settle();
@@ -1115,6 +1173,7 @@ impl Process {
     /// or a process's end. What was written through a MAP_SHARED mapping is then in the file, for
     /// the next mapping of it and for read.
     pub(crate) fn trim_file_pages(&self) {
+        self.trim_page_cache();
         if self.file_pages.borrow().is_empty() {
             return;
         }
@@ -1144,10 +1203,37 @@ impl Process {
         self.frames.borrow_mut().reap();
     }
 
+    /// The page cache's frames no mapping holds any more (the table's is their last reference)
+    /// let go, so unmapped pages are not kept around.
+    fn trim_page_cache(&self) {
+        let mut cache = self.page_cache.borrow_mut();
+        if cache.is_empty() {
+            return;
+        }
+        let mut f = self.frames.borrow_mut();
+        cache.retain(|_, &mut pa| {
+            let idle = f.count(pa) == 1;
+            if idle {
+                f.decref(pa);
+            }
+            !idle
+        });
+        f.reap();
+    }
+
+    /// Every frame of the page cache let go of (what still maps one keeps it): before a snapshot,
+    /// which does not hold the table.
+    pub(crate) fn drop_page_cache(&self) {
+        let mut f = self.frames.borrow_mut();
+        for (_, pa) in std::mem::take(&mut *self.page_cache.borrow_mut()) {
+            f.decref(pa);
+        }
+    }
+
     /// The write to the page at `page` (in the frame `pa`, which others may map): it gets a frame
     /// of its own, or the one it has made writable if nobody else maps it. `ro` keeps it read-only
     /// (a host write to a read-only page).
-    fn unshare(&self, page: u64, pa: u64, vma: &Vma, ro: bool) -> Result<u64, Miss> {
+    fn unshare(&self, page: u64, start: u64, pa: u64, vma: &Vma, ro: bool) -> Result<u64, Miss> {
         let mut mm = self.p.mm.borrow_mut();
         let mut f = self.frames.borrow_mut();
         let Some(slot) = mm.slot(&f, page) else {
@@ -1165,6 +1251,17 @@ impl Process {
             f.copy(pa, new);
             f.put(slot, (keep & !ADDR) | new);
             f.decref(pa);
+            // If the page cache's frame is all that is left of it, it goes now: its bytes were
+            // copied to be written, and it would stay until the next unmap
+            if f.count(pa) == 1 && vma.file.is_some() && !vma.shared {
+                let gen = vma.file.and_then(|b| self.fs(|fs| fs.data_gen(b.ino)).flatten());
+                let key = gen.and_then(|g| cache_key(page, start, vma, g));
+                let mut cache = self.page_cache.borrow_mut();
+                if let Some(k) = key.filter(|k| cache.get(k) == Some(&pa)) {
+                    cache.remove(&k);
+                    f.decref(pa);
+                }
+            }
             new
         };
         mm.flush.push(page >> 12);

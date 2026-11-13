@@ -278,6 +278,12 @@ pub struct Process {
     /// The pages of files mapped MAP_SHARED, one frame each whoever maps them: (file, offset)
     /// -> frame, which this holds a reference on (mm.rs `populate`)
     pub(crate) file_pages: RefCell<BTreeMap<(Ino, u64), u64>>,
+    /// The pages of files mapped MAP_PRIVATE that were read into a frame: (file, its data
+    /// generation, offset, bytes read) -> frame, which this holds a reference on. Another mapping
+    /// of the same page of the same bytes maps that frame read-only (a write copies it, for the
+    /// table's reference is one more than its own); `trim_file_pages` lets go of those nothing
+    /// maps. Not saved: a snapshot is taken without it.
+    pub(crate) page_cache: RefCell<BTreeMap<(Ino, u64, u64, u32), u64>>,
     /// The process that runs
     pub(crate) p: Proc,
     /// The other processes (zombies too), by pid
@@ -651,6 +657,7 @@ impl Process {
             need: RefCell::new(Vec::new()),
             filled: Cell::new(0),
             file_pages: RefCell::new(BTreeMap::new()),
+            page_cache: RefCell::new(BTreeMap::new()),
             p: Proc {
                 pid: INIT,
                 ppid: 1,
@@ -1274,6 +1281,8 @@ impl Process {
     pub fn save<H: Host>(&mut self, cpu: &Cpu<H>) -> Vec<u8> {
         self.park(cpu);
         self.compact();
+        // The saved reference counts must not include the page cache's (a restore would leak them)
+        self.drop_page_cache();
         let now = Instant::now();
         let mut w = W(MAGIC.to_vec());
         w.u(self.ram_size);
@@ -1585,6 +1594,7 @@ impl Process {
             need: RefCell::new(Vec::new()),
             filled: Cell::new(filled),
             file_pages: RefCell::new(file_pages),
+            page_cache: RefCell::new(BTreeMap::new()),
             p: first,
             procs: all,
             threads,

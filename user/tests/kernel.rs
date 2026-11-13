@@ -228,6 +228,89 @@ fn a_file_mapped_shared_is_the_same_memory_in_every_process_that_maps_it() {
     assert_eq!(out, b"in the file");
 }
 
+/// `ldrb w11, [x9]` for the address saved at `at`, checked to be `byte`
+fn expect_byte(p: &mut Prog, at: u32, byte: u8) {
+    p.arg(9, X(at));
+    p.code.push(0x3940_012b);
+    p.code.push(0xaa0b_03e0); // mov x0, x11
+    p.expect(byte as i64);
+}
+
+/// `strb w10, [x9]`: the address saved at `at` gets `byte`
+fn store_byte(p: &mut Prog, at: u32, byte: u8) {
+    p.arg(9, X(at));
+    p.li(10, byte as u64);
+    p.code.push(0x3900_012a);
+}
+
+/// Waits for the host: a read of two bytes of the terminal, answered by `input(b"x\n")`
+fn stop(p: &mut Prog) {
+    p.sys(63, &[I(0), D(0x1500), I(2)]).expect(2);
+}
+
+#[test]
+fn private_file_pages_are_one_frame_until_written() {
+    let mut p = Prog::default();
+    p.put(0x200, b"/tmp/f\0").put(0x300, &[b'A'; 4096]).put(0x1400, b"C");
+    // The file, one page of As, mapped MAP_PRIVATE twice
+    p.sys(56, &[I(0xffff_ff9c), D(0x200), I(0o102), I(0o600)]).expect(3);
+    p.sys(64, &[I(3), D(0x300), I(4096)]); // 4096 does not fit a check
+    p.sys(222, &[I(0), I(4096), I(3), I(2), I(3), I(0)]).save(0x100);
+    p.sys(222, &[I(0), I(4096), I(3), I(2), I(3), I(0)]).save(0x108);
+    stop(&mut p); // 0: mapped, nothing touched
+    // The first mapping's page is read into a frame; the second's is that frame
+    expect_byte(&mut p, 0x100, b'A');
+    stop(&mut p); // 1
+    expect_byte(&mut p, 0x108, b'A');
+    stop(&mut p); // 2
+    // A write through the first is its own copy: the second still has the file's bytes
+    store_byte(&mut p, 0x100, b'B');
+    expect_byte(&mut p, 0x100, b'B');
+    expect_byte(&mut p, 0x108, b'A');
+    stop(&mut p); // 3
+    // pwrite(fd, "C", 1, 0): a mapping made after it reads the new bytes (the cached page is for
+    // the old ones), and the second one, made before, goes on with what it has
+    p.sys(68, &[I(3), D(0x1400), I(1), I(0)]).expect(1);
+    p.sys(222, &[I(0), I(4096), I(3), I(2), I(3), I(0)]).save(0x110);
+    expect_byte(&mut p, 0x110, b'C');
+    expect_byte(&mut p, 0x108, b'A');
+    stop(&mut p); // 4
+    for at in [0x100, 0x108, 0x110] {
+        p.sys(215, &[X(at), I(4096)]).expect(0);
+    }
+    stop(&mut p); // 5
+
+    let mut vm = machine_with_prog(&p.elf());
+    let board = vm.board.clone();
+    let mut proc = Process::exec(&mut vm.cpus[0], board, &["/usr/bin/prog".into()], &[], "/").unwrap();
+    let mut frames = Vec::new();
+    for _ in 0..6 {
+        let begun = std::time::Instant::now();
+        loop {
+            let status = proc.run_on(&mut vm.cpus, std::time::Duration::from_millis(20));
+            if matches!(status, armless_user::Status::Idle(_)) {
+                break;
+            }
+            assert!(matches!(status, armless_user::Status::Running), "{status:?}");
+            assert!(begun.elapsed() < std::time::Duration::from_secs(10), "still running");
+        }
+        frames.push(proc.frames_in_use() as i64);
+        proc.input(b"x\n");
+    }
+    let (_, status) = run(&mut proc, &mut vm);
+    ok(&status);
+    // Reading a page costs a frame (and the page table's); a second mapping of it costs none, a
+    // write its copy
+    assert_eq!(frames[2], frames[1], "the second mapping shares the first's frame: {frames:?}");
+    assert_eq!(frames[3] - frames[2], 1, "the write copies the page: {frames:?}");
+    // The cached frame still holds the old bytes for the second mapping, so a mapping made after
+    // the file changed gets a frame of its own
+    assert_eq!(frames[4] - frames[3], 1, "new bytes, new frame: {frames:?}");
+    // Unmapped, all of it is back: the copy, the old and new file pages (the page cache keeps none
+    // of them) and the page table
+    assert_eq!(frames[5], frames[0], "nothing is kept once unmapped: {frames:?}");
+}
+
 #[test]
 fn chown_gives_a_file_away_as_root_and_not_otherwise() {
     let mut p = Prog::default();

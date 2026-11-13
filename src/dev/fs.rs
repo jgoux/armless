@@ -96,6 +96,9 @@ pub struct Inode {
     pub content: Content,
     /// References from 9p fids (not saved; recomputed from the fid table).
     pub refs: u32,
+    /// Which version of its bytes and size it holds: a stamp from the file system's clock, new
+    /// at creation and at every write or truncate (not saved: a restore stamps afresh)
+    pub data_gen: u64,
 }
 
 impl Inode {
@@ -230,6 +233,8 @@ pub struct Fs {
     /// Chunks a waiting read covers: kept until it completes, so a read over
     /// several chunks doesn't lose the first while it waits for the next.
     pinned: HashSet<String>,
+    /// The last `Inode::data_gen` handed out
+    clock: u64,
 }
 
 impl Fs {
@@ -246,6 +251,7 @@ impl Fs {
             max_cached: DEFAULT_CACHE,
             failed: HashSet::new(),
             pinned: HashSet::new(),
+            clock: 0,
         };
         let root = fs.alloc(Inode {
             mode: S_IFDIR | 0o755,
@@ -262,6 +268,7 @@ impl Fs {
                 parent: ROOT,
             },
             refs: 0,
+            data_gen: 0,
         });
         debug_assert_eq!(root, ROOT);
         fs
@@ -308,6 +315,7 @@ impl Fs {
                 ctime: mtime,
                 content: Content::Special,
                 refs: 0,
+                data_gen: 0,
             };
             match mode & S_IFMT {
                 S_IFDIR => {
@@ -384,7 +392,20 @@ impl Fs {
         Ok(chunks)
     }
 
-    fn alloc(&mut self, inode: Inode) -> Ino {
+    /// A stamp no inode has had before.
+    fn next_gen(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    /// The version of the file's bytes and size (`Inode::data_gen`): what is cached from them
+    /// is good while it is the same.
+    pub fn data_gen(&self, ino: Ino) -> Option<u64> {
+        Some(self.get(ino)?.data_gen)
+    }
+
+    fn alloc(&mut self, mut inode: Inode) -> Ino {
+        inode.data_gen = self.next_gen();
         let ino = if let Some(i) = self.free.pop() {
             self.inodes[i as usize] = Some(inode);
             i
@@ -522,6 +543,7 @@ impl Fs {
             ctime: t,
             content,
             refs: 0,
+            data_gen: 0,
         });
         self.link_into(dir, name, ino);
         let d = self.inode_mut(dir)?;
@@ -931,6 +953,14 @@ impl Fs {
         Ok(out)
     }
 
+    /// A new version of the file's bytes, before a change of them (a write that waits for a blob
+    /// and runs again changes nothing, and costs a version).
+    fn bump(&mut self, ino: Ino) -> Res<()> {
+        let g = self.next_gen();
+        self.inode_mut(ino)?.data_gen = g;
+        Ok(())
+    }
+
     /// Make a file's contents writable (a private copy).
     fn materialize(&mut self, ino: Ino) -> Res<&mut Vec<u8>> {
         if let Content::Blob(_) = self.inode(ino)?.content {
@@ -952,6 +982,7 @@ impl Fs {
             return Err(EFBIG.into());
         }
         let size = self.inode(ino)?.size;
+        self.bump(ino)?;
         self.chunk_if_large(ino, size.max(end))?;
         if let Content::Chunks(_) = self.inode(ino)?.content {
             self.write_chunks(ino, offset, bytes)?;
@@ -977,6 +1008,7 @@ impl Fs {
         if size > MAX_FILE {
             return Err(EFBIG.into());
         }
+        self.bump(ino)?;
         if size == 0 {
             if let Content::Blob(_) | Content::Chunks(_) = self.inode(ino)?.content {
                 self.inode_mut(ino)?.content = Content::Mem(Vec::new());
@@ -1414,6 +1446,7 @@ impl Fs {
                 },
                 _ => Content::Special,
             };
+            let data_gen = fs.next_gen();
             fs.inodes.push(Some(Inode {
                 mode,
                 uid,
@@ -1426,6 +1459,7 @@ impl Fs {
                 ctime: times[2],
                 content,
                 refs: 0,
+                data_gen,
             }));
         }
         fs.get(ROOT)?;

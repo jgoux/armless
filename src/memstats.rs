@@ -21,6 +21,10 @@ pub static FRAMES_LIVE: AtomicU64 = AtomicU64::new(0);
 /// File pages filled into a fresh frame, and the bytes copied into them.
 pub static POPULATE_FAULTS: AtomicU64 = AtomicU64::new(0);
 pub static POPULATE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Private file pages a fault took from the page cache instead of reading, and the most pages it
+/// held at once.
+pub static PAGE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+pub static PAGE_CACHE_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
 // Start-up time. Nanoseconds are cumulative, summed over the threads that spend them (not wall time).
 /// zstd blobs decompressed (natively: `zstd::decompress`), their compressed bytes, the time, and
@@ -87,7 +91,7 @@ impl Drop for Timed {
 }
 
 /// The number of counters `counters` lists.
-pub const COUNTERS: usize = 36;
+pub const COUNTERS: usize = 38;
 
 /// The counters, named, as one list (glibc's `mallinfo2` fields come last, 0 elsewhere).
 pub fn counters() -> [(&'static str, u64); COUNTERS] {
@@ -105,6 +109,8 @@ pub fn counters() -> [(&'static str, u64); COUNTERS] {
         ("frames_live", FRAMES_LIVE.load(Relaxed)),
         ("populate_faults", POPULATE_FAULTS.load(Relaxed)),
         ("populate_bytes", POPULATE_BYTES.load(Relaxed)),
+        ("page_cache_hits", PAGE_CACHE_HITS.load(Relaxed)),
+        ("page_cache_entries", PAGE_CACHE_ENTRIES.load(Relaxed)),
         ("zstd_calls", ZSTD_CALLS.load(Relaxed)),
         ("zstd_in_bytes", ZSTD_IN_BYTES.load(Relaxed)),
         ("zstd_ns", ZSTD_NS.load(Relaxed)),
