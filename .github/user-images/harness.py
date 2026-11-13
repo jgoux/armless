@@ -45,6 +45,7 @@ HOOK = "/aws/lambda-microvms/runtime/v1"
 DRAIN_MS = 15000
 CHECK_BUDGET_S = 240  # what armless-exec's own --timeout adds to the ready budget: the requests (3 x 30 s) and the terminate hook (60 s)
 SAMPLE_S = 0.2  # the PSS sampler's period
+DHAT_GRACE_S = 900  # what a dhat build gets to write its profile after SIGTERM (it symbolizes the backtraces then; the plain 10 s would kill it mid-write)
 
 # the catalog's entrypoints (m3b LAUNCHER) and the hook deadlines build.sh raises (m3b LAUNCHER_ENV)
 LAUNCHER = {
@@ -438,17 +439,19 @@ def start(a, plan, case, tag, traced, timeout):
     env = dict(os.environ)
     if traced:
         env["ARMLESS_EXEC_TRACE"] = "1"
+    if a.dhat:  # a dhat build (--features dhat-heap): the profile of the untraced start only; set and empty, the traced start does not run the profiler
+        env["ARMLESS_DHAT_OUT"] = "" if traced else os.path.join(a.out, "dhat-heap.json")
     fo = open(out_p, "wb")
     fe = subprocess.PIPE if traced else open(err_p, "wb")
     p = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe)
     return p, [fo] + ([] if traced else [fe]), cmd, out_p, err_p
 
 
-def stop(p, files):
+def stop(p, files, grace=10):
     if p.poll() is None:
         p.terminate()
         try:
-            p.wait(10)
+            p.wait(grace)
         except subprocess.TimeoutExpired:
             p.kill()
             p.wait()
@@ -488,7 +491,7 @@ def run_once(a, plan, case, tag, traced, budget):
         # the process may have ended by itself with its report: give it a moment to flush before stopping it
         time.sleep(0.5)
         exited = p.poll() is not None
-        stop(p, files)
+        stop(p, files, DHAT_GRACE_S if a.dhat and not traced else 10)
         if sampler:
             sampler.halt()
         if pump:
@@ -565,6 +568,16 @@ def cmd_cell(a):
                   stderr_tail=tail_lines(run["stderr"]), stdout_tail=tail_lines(run["stdout"], 20))
     logs = scan_log(run["stdout"], "guest output") + scan_log(run["stderr"], "armless-exec stderr")
     squeeze(run["stderr"])
+    if a.dhat:  # the profile's top allocation sites at its peak, in the artifact next to dhat-heap.json
+        dh = os.path.join(a.out, "dhat-heap.json")
+        if os.path.exists(dh):
+            top = subprocess.run([sys.executable, "-I", os.path.join(os.path.dirname(os.path.abspath(__file__)), "dhat_top.py"), dh], capture_output=True, text=True)
+            with open(os.path.join(a.out, "dhat-top.txt"), "w") as f:
+                f.write(top.stdout + top.stderr)
+            result["dhat"] = f"dhat-top.txt ({os.path.getsize(dh)} bytes of dhat-heap.json)" if top.returncode == 0 else f"dhat_top.py exit {top.returncode}"
+        else:
+            result["dhat"] = "no dhat-heap.json written (a binary without --features dhat-heap, or killed before the write)"
+        print(f"{name}: dhat: {result['dhat']}", flush=True)
 
     # 2. traced, always: every call armless answered ENOSYS or EOPNOTSUPP, and the first failure's classification
     tr = run_once(a, plan, case, name + "-trace", True, a.ready_timeout)
@@ -721,6 +734,7 @@ def main():
     c.add_argument("--out", required=True)
     c.add_argument("--ready-timeout", type=float, default=300)
     c.add_argument("--exec-arg", action="append", default=[])
+    c.add_argument("--dhat", action="store_true", help="the binary was built with --features dhat-heap: profile the untraced start (ARMLESS_DHAT_OUT in --out)")
     r = sub.add_parser("report")
     r.add_argument("--in", dest="inp", required=True)
     r.add_argument("--out", required=True)

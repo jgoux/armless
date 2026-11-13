@@ -17,6 +17,13 @@
 #   gh workflow run user-images.yml -R jgoux/armless --ref ci/user-images -f ref=main
 #   gh workflow run user-images.yml -R jgoux/armless --ref ci/user-images -f ref=feat/user-sockets,feat/user-processes
 # A push to ci/user-images runs the refs of .github/user-images/REFS.
+#
+# Where the host heap goes (a ref with `--memstats` and the dhat-heap feature, e.g. diag/exec-memstats): `features` is passed to the armless-exec build
+# as `--features`; with dhat-heap the build keeps line tables (CARGO_PROFILE_RELEASE_DEBUG=line-tables-only, for frames dhat can name) and the untraced
+# start of each cell runs with dhat's allocator and profiler (the traced start does not run the profiler). The cell artifact then holds dhat-heap.json
+# and dhat-top.txt (the top 25 allocation sites at the heap's peak, armless frames), beside the start's stderr with the `memstats ready/peak` lines.
+# dhat slows the guest down a lot (a lock on every allocation): give it time through ready_timeout, and note its peak PSS is not the plain build's.
+#   gh workflow run user-images.yml -R jgoux/armless --ref ci/user-images -f ref=diag/exec-memstats -f features=dhat-heap -f exec_args="--memstats" -f ready_timeout=1500
 name: user-images
 on:
   workflow_dispatch:
@@ -30,6 +37,9 @@ on:
       ready_timeout:
         description: "seconds an image gets to become ready"
         default: "300"
+      features:
+        description: "cargo features of the armless-exec build, comma-separated (e.g. dhat-heap: a heap profile of the untraced start of each cell)"
+        default: ""
   push:
     branches: [ci/user-images]
 
@@ -95,6 +105,8 @@ jobs:
     needs: source
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
+    env:
+      FEATURES: ${{ inputs.features }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -108,10 +120,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "armless-src -> build"
+          key: ${{ inputs.features }}
       - name: armless-exec
         working-directory: armless-src
         run: |
-          cargo build --release -p armless-user --bin armless-exec
+          flags=()
+          if [ -n "$FEATURES" ]; then flags+=(--features "$FEATURES"); fi
+          case ",$FEATURES," in *,dhat-heap,*) export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only ;; esac
+          cargo build --release -p armless-user --bin armless-exec "${flags[@]}"
           mkdir -p ../bin
           cp build/release/armless-exec ../bin/
           ../bin/armless-exec 2>&1 | head -3 || true
@@ -175,7 +191,8 @@ jobs:
       matrix:
         image: [go, node, nginx, python, shell, deno, node-runtime]
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
+    # two starts of up to ready_timeout + 240 s each (+ 15 min for dhat's profile write): a long ready_timeout must not hit the job's own limit
+    timeout-minutes: ${{ inputs.features != '' && 180 || 60 }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -194,11 +211,13 @@ jobs:
         env:
           EXEC_ARGS: ${{ inputs.exec_args }}
           READY_TIMEOUT: ${{ inputs.ready_timeout || '300' }}
+          FEATURES: ${{ inputs.features }}
         run: |
           set -o pipefail
           mkdir -p data
           extra=()
           for a in $EXEC_ARGS; do extra+=("--exec-arg=$a"); done
+          case ",$FEATURES," in *,dhat-heap,*) extra+=(--dhat) ;; esac
           python3 -I $IMAGES/harness.py cell --image ${{ matrix.image }} --fs "$PWD/pkg" --armless-exec "$PWD/bin/armless-exec" --out data \
             --ready-timeout "$READY_TIMEOUT" "${extra[@]}" 2>&1 | tee data/harness.log
       - uses: actions/upload-artifact@v4
