@@ -846,21 +846,19 @@ impl<H: Host> Cpu<H> {
     }
 
     /// The regions native code for EL `el` reaches at fixed addresses (`native::Bases`): this CPU,
-    /// guest RAM and that EL's fast TLB tables. `jit_run` passes their starts to every function.
+    /// guest RAM and that EL's two fast TLB tables. `jit_run` passes their starts to every function.
     #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
     #[inline(always)]
     fn jit_bases(&self, el: usize) -> native::Bases {
-        let [rt, rb, wt, wb] = self.fast[el].tables();
+        let [r, w] = self.fast[el].tables();
         native::Bases([
             (
                 self as *const Self as u64,
                 std::mem::size_of::<Self>() as u64,
             ),
             (self.mem.as_ptr() as u64, self.mem.len() as u64),
-            rt,
-            rb,
-            wt,
-            wb,
+            r,
+            w,
         ])
     }
 
@@ -1108,10 +1106,8 @@ impl<H: Host> Cpu<H> {
             // with one CPU (the non-shared import type does not match it).
             smp: (cfg!(target_feature = "atomics") || self.machine.ncpus > 1) as u64,
             mem: a(self.mem.as_ptr()),
-            read_tag: a(f.read_tag_ptr()),
-            read_base: a(f.read_base_ptr()),
-            write_tag: a(f.write_tag_ptr()),
-            write_base: a(f.write_base_ptr()),
+            read: a(f.read_ptr()),
+            write: a(f.write_ptr()),
         }
     }
 
@@ -1148,7 +1144,7 @@ impl<H: Host> Cpu<H> {
             // is passed (the same ones), and its helpers through CURRENT, while nothing else uses
             // the CPU.
             let status = unsafe {
-                type Block = extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i32;
+                type Block = extern "C" fn(i64, i64, i64, i64, i64) -> i32;
                 let f: Block = std::mem::transmute(f);
                 f(
                     pc as i64,
@@ -1156,8 +1152,6 @@ impl<H: Host> Cpu<H> {
                     b[1].0 as i64,
                     b[2].0 as i64,
                     b[3].0 as i64,
-                    b[4].0 as i64,
-                    b[5].0 as i64,
                 )
             };
             CURRENT.set(previous);

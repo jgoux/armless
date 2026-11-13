@@ -79,11 +79,11 @@ pub struct Cached {
 }
 
 /// What `BASES` functions take after the PC: the host regions their code reaches at fixed
-/// addresses, as (start, length) — the CPU itself, guest RAM and the fast TLB's four tables for the
+/// addresses, as (start, length) — the CPU itself, guest RAM and the fast TLB's two tables for the
 /// code's EL. An address in one of them is compiled as the parameter plus an offset, one
 /// instruction where its 64-bit constant took four or five; the caller passes the same starts, so
 /// the addresses are the ones compiled in (the code was always for this CPU's addresses).
-pub const BASES: usize = 6;
+pub const BASES: usize = 4;
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Bases(pub [(u64, u64); BASES]);

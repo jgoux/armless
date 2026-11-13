@@ -113,8 +113,8 @@ impl<H: Host> Cpu<H> {
         if off + 32 <= 0x1000 && self.excl_armed == 0 {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
-            if f.write_tag[i] == va >> 12 {
-                let a = f.write_base[i] as usize + off as usize;
+            if f.write[i].tag == va >> 12 {
+                let a = f.write[i].base as usize + off as usize;
                 let words = [v1 as u64, (v1 >> 64) as u64, v2 as u64, (v2 >> 64) as u64];
                 for (k, w) in words.into_iter().enumerate() {
                     self.ram_store(a + 8 * k, 8, w);
@@ -1325,8 +1325,8 @@ mod tests {
             let v2 = !v1;
             // Page 0x40 is served for writes, page 0x41 is not.
             let el = c.el as usize;
-            c.fast[el].write_tag[0x40] = 0x40;
-            c.fast[el].write_base[0x40] = 0x40000;
+            c.fast[el].write[0x40].tag = 0x40;
+            c.fast[el].write[0x40].base = 0x40000;
             c.mem.write(0x40000, &[0xaa; 0x1000]);
             c.mem.write(0x41000, &[0xaa; 0x1000]);
             // The first component is in page 0x40, the second is not: nothing is stored.

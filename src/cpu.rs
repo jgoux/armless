@@ -299,14 +299,39 @@ fn each_filled(filled: &[u16], chunks: u64, mut f: impl FnMut(usize)) {
     }
 }
 
+/// One slot of a fast table: the virtual page it serves and the page's offset in `mem`, side by side so
+/// that a hit reads one cache line. The JIT's code reads the fields at these offsets: `tag` (a u64) at 0
+/// and `base` (a u32) at 8, an entry being 16 bytes.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct Entry {
+    /// The virtual page, or u64::MAX when the slot is empty.
+    tag: u64,
+    /// Page offset in RAM (u32 in every build: the JIT's code reads it as a 4-byte field).
+    base: u32,
+    _pad: u32,
+}
+
+/// Bytes of an `Entry`, the stride of compiled code's index into a fast table.
+pub(crate) const ENTRY_BYTES: usize = std::mem::size_of::<Entry>();
+/// Offset of `Entry::base` in an entry.
+pub(crate) const ENTRY_BASE: usize = std::mem::offset_of!(Entry, base);
+const _: () =
+    assert!(ENTRY_BYTES == 16 && ENTRY_BASE == 8 && std::mem::offset_of!(Entry, tag) == 0);
+
+impl Entry {
+    const EMPTY: Entry = Entry::new(u64::MAX, 0);
+
+    const fn new(tag: u64, base: u32) -> Entry {
+        Entry { tag, base, _pad: 0 }
+    }
+}
+
 /// Virtual page -> offset of the page in `mem`, for pages known to be RAM
 /// with the needed permission at one exception level.
 pub(crate) struct FastTlb {
-    read_tag: Vec<u64>,
-    /// Page offsets in RAM (u32 in every build: the JIT's code reads them as 4-byte entries).
-    read_base: Vec<u32>,
-    write_tag: Vec<u64>,
-    write_base: Vec<u32>,
+    read: Vec<Entry>,
+    write: Vec<Entry>,
     pub(crate) code_page: u64,
     pub(crate) code_base: usize,
     code_tag: Vec<u64>,
@@ -323,10 +348,8 @@ pub(crate) struct FastTlb {
 impl FastTlb {
     fn new() -> FastTlb {
         FastTlb {
-            read_tag: vec![u64::MAX; FAST_ENTRIES],
-            read_base: vec![0; FAST_ENTRIES],
-            write_tag: vec![u64::MAX; FAST_ENTRIES],
-            write_base: vec![0; FAST_ENTRIES],
+            read: vec![Entry::EMPTY; FAST_ENTRIES],
+            write: vec![Entry::EMPTY; FAST_ENTRIES],
             code_page: u64::MAX,
             code_base: 0,
             code_tag: vec![u64::MAX; CODE_ENTRIES],
@@ -340,8 +363,7 @@ impl FastTlb {
     #[inline]
     fn fill_read(&mut self, page: u64, base: usize) {
         let i = page as usize & (FAST_ENTRIES - 1);
-        self.read_tag[i] = page;
-        self.read_base[i] = base as u32;
+        self.read[i] = Entry::new(page, base as u32);
         self.filled(i);
     }
 
@@ -349,8 +371,7 @@ impl FastTlb {
     #[inline]
     fn fill_write(&mut self, page: u64, base: usize) {
         let i = page as usize & (FAST_ENTRIES - 1);
-        self.write_tag[i] = page;
-        self.write_base[i] = base as u32;
+        self.write[i] = Entry::new(page, base as u32);
         self.filled(i);
     }
 
@@ -365,8 +386,8 @@ impl FastTlb {
     pub(crate) fn flush(&mut self) {
         // Only filled slots hold entries: a context switch clears what it filled, not the table
         each_filled(&self.filled, self.chunks, |i| {
-            self.read_tag[i] = u64::MAX;
-            self.write_tag[i] = u64::MAX;
+            self.read[i].tag = u64::MAX;
+            self.write[i].tag = u64::MAX;
         });
         self.filled.clear();
         self.chunks = 0;
@@ -378,11 +399,11 @@ impl FastTlb {
     pub(crate) fn forget_page(&mut self, page: u64, mask: u64) {
         let i = page as usize & (FAST_ENTRIES - 1);
         // The slot is chosen by the low page bits, which `mask` keeps.
-        if self.read_tag[i] & mask == page {
-            self.read_tag[i] = u64::MAX;
+        if self.read[i].tag & mask == page {
+            self.read[i].tag = u64::MAX;
         }
-        if self.write_tag[i] & mask == page {
-            self.write_tag[i] = u64::MAX;
+        if self.write[i].tag & mask == page {
+            self.write[i].tag = u64::MAX;
         }
         if self.code_page & mask == page {
             self.code_page = u64::MAX;
@@ -397,38 +418,27 @@ impl FastTlb {
     pub(crate) fn forget_write_page(&mut self, base: usize) {
         // Only filled slots can hold an entry
         each_filled(&self.filled, self.chunks, |i| {
-            if self.write_tag[i] != u64::MAX && self.write_base[i] as usize == base {
-                self.write_tag[i] = u64::MAX;
+            if self.write[i].tag != u64::MAX && self.write[i].base as usize == base {
+                self.write[i].tag = u64::MAX;
             }
         });
     }
 
-    pub(crate) fn read_tag_ptr(&self) -> *const u8 {
-        self.read_tag.as_ptr() as *const u8
+    pub(crate) fn read_ptr(&self) -> *const u8 {
+        self.read.as_ptr() as *const u8
     }
-    pub(crate) fn read_base_ptr(&self) -> *const u8 {
-        self.read_base.as_ptr() as *const u8
-    }
-    pub(crate) fn write_tag_ptr(&self) -> *const u8 {
-        self.write_tag.as_ptr() as *const u8
-    }
-    pub(crate) fn write_base_ptr(&self) -> *const u8 {
-        self.write_base.as_ptr() as *const u8
+    pub(crate) fn write_ptr(&self) -> *const u8 {
+        self.write.as_ptr() as *const u8
     }
 
-    /// The four tables compiled code reads, as (start, bytes): read tags, read bases, write tags,
-    /// write bases. They are allocated once and never move.
+    /// The two tables compiled code reads, as (start, bytes): read entries, write entries. They are
+    /// allocated once and never move.
     #[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
-    pub(crate) fn tables(&self) -> [(u64, u64); 4] {
+    pub(crate) fn tables(&self) -> [(u64, u64); 2] {
         fn span<T>(v: &[T]) -> (u64, u64) {
             (v.as_ptr() as u64, std::mem::size_of_val(v) as u64)
         }
-        [
-            span(&self.read_tag),
-            span(&self.read_base),
-            span(&self.write_tag),
-            span(&self.write_base),
-        ]
+        [span(&self.read), span(&self.write)]
     }
 }
 
@@ -1649,10 +1659,10 @@ impl<H: Host> Cpu<H> {
         if !unpriv && off + size as u64 <= 0x1000 {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
-            if f.read_tag[i] == va >> 12 {
+            if f.read[i].tag == va >> 12 {
                 // SAFETY: a read hit, with `off + size <= 0x1000` checked above.
                 return Ok(unsafe {
-                    self.ram_load_in_page(f.read_base[i] as usize + off as usize, size)
+                    self.ram_load_in_page(f.read[i].base as usize + off as usize, size)
                 });
             }
         }
@@ -1668,10 +1678,10 @@ impl<H: Host> Cpu<H> {
         if off + size as u64 <= 0x1000 {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
-            if f.read_tag[i] == va >> 12 {
+            if f.read[i].tag == va >> 12 {
                 // SAFETY: a read hit, with `off + size <= 0x1000` checked above.
                 return Some(unsafe {
-                    self.ram_load_in_page(f.read_base[i] as usize + off as usize, size)
+                    self.ram_load_in_page(f.read[i].base as usize + off as usize, size)
                 });
             }
         }
@@ -1686,8 +1696,8 @@ impl<H: Host> Cpu<H> {
         if off + 2 * size as u64 <= 0x1000 {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
-            if f.read_tag[i] == va >> 12 {
-                let a = f.read_base[i] as usize + off as usize;
+            if f.read[i].tag == va >> 12 {
+                let a = f.read[i].base as usize + off as usize;
                 // SAFETY: a read hit, with `off + 2 * size <= 0x1000` checked above.
                 return Some(unsafe {
                     (
@@ -1732,8 +1742,8 @@ impl<H: Host> Cpu<H> {
         if !unpriv && off + size as u64 <= 0x1000 && self.excl_armed == 0 {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
-            if f.write_tag[i] == va >> 12 {
-                let a = f.write_base[i] as usize + off as usize;
+            if f.write[i].tag == va >> 12 {
+                let a = f.write[i].base as usize + off as usize;
                 // SAFETY: a write hit, with `off + size <= 0x1000` checked above.
                 unsafe { self.ram_store_in_page(a, size, value) };
                 return Ok(());
@@ -1751,8 +1761,8 @@ impl<H: Host> Cpu<H> {
         if off + size as u64 <= 0x1000 && self.excl_armed == 0 {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
-            if f.write_tag[i] == va >> 12 {
-                let a = f.write_base[i] as usize + off as usize;
+            if f.write[i].tag == va >> 12 {
+                let a = f.write[i].base as usize + off as usize;
                 // SAFETY: a write hit, with `off + size <= 0x1000` checked above.
                 unsafe { self.ram_store_in_page(a, size, value) };
                 return true;
@@ -1770,8 +1780,8 @@ impl<H: Host> Cpu<H> {
         if off + 2 * size as u64 <= 0x1000 && self.excl_armed == 0 {
             let f = &self.fast[self.el as usize];
             let i = (va >> 12) as usize & (FAST_ENTRIES - 1);
-            if f.write_tag[i] == va >> 12 {
-                let a = f.write_base[i] as usize + off as usize;
+            if f.write[i].tag == va >> 12 {
+                let a = f.write[i].base as usize + off as usize;
                 // SAFETY: a write hit, with `off + 2 * size <= 0x1000` checked above.
                 unsafe {
                     self.ram_store_in_page(a, size, first);
@@ -1926,7 +1936,7 @@ mod fast_tlb_tests {
     }
 
     fn empty(f: &FastTlb) -> bool {
-        f.read_tag.iter().chain(&f.write_tag).all(|&t| t == u64::MAX)
+        f.read.iter().chain(&f.write).all(|e| e.tag == u64::MAX)
     }
 
     /// A flush leaves no entry whether the fills were few (the exact list), many and clustered,
@@ -1953,8 +1963,8 @@ mod fast_tlb_tests {
         let b = fill(&mut f, 0x9_0800u64..0x9_0808, 0x6000); // slots apart from a's
         f.forget_write_page(0x5000);
         let slot = |p: u64| p as usize & (FAST_ENTRIES - 1);
-        assert!(a.iter().all(|&p| f.write_tag[slot(p)] == u64::MAX && f.read_tag[slot(p)] == p));
-        assert!(b.iter().all(|&p| f.write_tag[slot(p)] == p));
+        assert!(a.iter().all(|&p| f.write[slot(p)].tag == u64::MAX && f.read[slot(p)].tag == p));
+        assert!(b.iter().all(|&p| f.write[slot(p)].tag == p));
     }
 }
 

@@ -21,6 +21,7 @@ mod fp;
 
 use super::wasm::{Code, FuncType, Import, EMPTY, I32, I64};
 use crate::bits::{bit, decode_bit_masks, field, sext};
+use crate::cpu::{ENTRY_BASE, ENTRY_BYTES};
 use crate::sysreg::sr;
 
 /// Addresses the generated code uses: linear-memory addresses (wasm32 pointers) in the browser,
@@ -65,11 +66,9 @@ pub struct Layout {
     pub irq_dirty: u64,
     /// Guest RAM base.
     pub mem: u64,
-    /// Fast TLB arrays for this block's EL (u64 tags, u32 page offsets).
-    pub read_tag: u64,
-    pub read_base: u64,
-    pub write_tag: u64,
-    pub write_base: u64,
+    /// Fast TLB tables for this block's EL: arrays of `cpu::Entry` (a u64 tag at 0, a u32 page offset at 8).
+    pub read: u64,
+    pub write: u64,
 }
 
 // What a block returns, and what the interpreter helper returns to it (a non-zero one ends the
@@ -463,10 +462,10 @@ impl Gen<'_> {
     /// Load `size` bytes at VA into the stack as i64 (zero-extended).
     fn load(&mut self, size: u32) {
         let l = *self.l;
-        self.tlb_probe(l.read_tag, size);
+        self.tlb_probe(l.read, size);
         self.c.if_(I64);
         {
-            self.host_addr(l.read_base);
+            self.host_addr(l.read);
             match size {
                 1 => self.c.i64_load8_u(l.mem),
                 2 => self.c.i64_load16_u(l.mem),
@@ -487,10 +486,10 @@ impl Gen<'_> {
     /// Store the i64 in local DATA (low `size` bytes) at VA.
     fn store(&mut self, size: u32) {
         let l = *self.l;
-        self.tlb_probe_unarmed(l.write_tag, size);
+        self.tlb_probe_unarmed(l.write, size);
         self.c.if_(EMPTY);
         {
-            self.host_addr(l.write_base);
+            self.host_addr(l.write);
             self.c.get(DATA);
             match size {
                 1 => self.c.i64_store8(l.mem),
@@ -518,21 +517,21 @@ impl Gen<'_> {
         self.c.set(VA);
     }
 
-    /// Push whether the fast table serves the access: (tag[idx] == VA >> 12) && ((VA & 0xfff) + size <= 0x1000),
-    /// as the one comparison tag[idx] == (VA + size - 1) >> 12, which a branch takes at once (two conditions and
+    /// Push whether the fast table serves the access: (entry[idx].tag == VA >> 12) && ((VA & 0xfff) + size <= 0x1000),
+    /// as the one comparison entry[idx].tag == (VA + size - 1) >> 12, which a branch takes at once (two conditions and
     /// their `and` made 0/1 values first). The access's last byte is in VA's page then, and in the next one
     /// (VA >> 12) + 1 when it crosses, which no tag at idx is: a slot holds pages whose low bits are its index,
     /// and those of the next page are the next index. Sets IDX.
-    fn tlb_probe(&mut self, tags: u64, size: u32) {
-        self.tlb_compare(tags, size);
+    fn tlb_probe(&mut self, entries: u64, size: u32) {
+        self.tlb_compare(entries, size);
         self.c.i64_eq();
     }
 
     /// `tlb_probe` for a plain store: also false while an exclusive monitor is armed (the store must clear it,
     /// on the slow path), as the flag's byte at bit 56 of the page compared: no tag is that large.
-    fn tlb_probe_unarmed(&mut self, tags: u64, size: u32) {
+    fn tlb_probe_unarmed(&mut self, entries: u64, size: u32) {
         let l = *self.l;
-        self.tlb_compare(tags, size);
+        self.tlb_compare(entries, size);
         self.c.i32c(0);
         self.c.i32_load8_u(l.excl_armed);
         self.c.i64_extend_i32_u();
@@ -542,8 +541,8 @@ impl Gen<'_> {
         self.c.i64_eq();
     }
 
-    /// Push tag[idx] (sets IDX, idx = (VA >> 12) % FAST_ENTRIES) and the page of the access's last byte.
-    fn tlb_compare(&mut self, tags: u64, size: u32) {
+    /// Push entry[idx].tag (sets IDX, idx = (VA >> 12) % FAST_ENTRIES) and the page of the access's last byte.
+    fn tlb_compare(&mut self, entries: u64, size: u32) {
         self.c.get(VA);
         self.c.i64c(12);
         self.c.i64_shr_u();
@@ -551,9 +550,9 @@ impl Gen<'_> {
         self.c.i32c(crate::cpu::FAST_ENTRIES as i32 - 1);
         self.c.i32_and();
         self.c.tee(IDX);
-        self.c.i32c(3);
+        self.c.i32c(ENTRY_BYTES.trailing_zeros() as i32);
         self.c.i32_shl();
-        self.c.i64_load(tags);
+        self.c.i64_load(entries);
         self.c.get(VA);
         if size > 1 {
             self.c.i64c(size as i64 - 1);
@@ -563,12 +562,13 @@ impl Gen<'_> {
         self.c.i64_shr_u();
     }
 
-    /// Push the i32 host offset (page base + VA & 0xfff), relative to `mem`.
-    fn host_addr(&mut self, bases: u64) {
+    /// Push the i32 host offset (entry[idx].base + VA & 0xfff), relative to `mem`; `entries` is the table's
+    /// start, the one `tlb_probe` took.
+    fn host_addr(&mut self, entries: u64) {
         self.c.get(IDX);
-        self.c.i32c(2);
+        self.c.i32c(ENTRY_BYTES.trailing_zeros() as i32);
         self.c.i32_shl();
-        self.c.i32_load(bases);
+        self.c.i32_load(entries + ENTRY_BASE as u64);
         self.c.get(VA);
         self.c.i32_wrap_i64();
         self.c.i32c(0xfff);
@@ -1394,9 +1394,9 @@ impl Gen<'_> {
             return true;
         }
         if load {
-            self.tlb_probe(l.read_tag, size);
+            self.tlb_probe(l.read, size);
             self.c.if_(EMPTY);
-            self.host_addr(l.read_base);
+            self.host_addr(l.read);
             self.c.set(ST);
             self.load_at_st(size);
             self.c.set(T0);
@@ -1412,9 +1412,9 @@ impl Gen<'_> {
             self.interp(insn);
             self.c.end();
         } else {
-            self.tlb_probe(l.write_tag, size);
+            self.tlb_probe(l.write, size);
             self.c.if_(EMPTY);
-            self.host_addr(l.write_base);
+            self.host_addr(l.write);
             self.c.set(ST);
             // ok = armed && same 64-byte granule
             self.c.i32c(0);
