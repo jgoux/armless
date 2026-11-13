@@ -29,7 +29,7 @@ pub(crate) const PAGE_INSNS: usize = 1024;
 /// Ops in a slot: one per instruction, and the `End` that follows the last.
 pub(crate) const SLOT_OPS: usize = PAGE_INSNS + 1;
 /// Pages kept decoded (16 KiB each: 24 MiB); past that the slot of the page used the longest ago is reused.
-const MAX_SLOTS: usize = 1536;
+const MAX_SLOTS: usize = 384;
 /// Instructions decoded at once, at most, when the loop meets one that is not decoded yet.
 pub(crate) const BLOCK: usize = 64;
 pub(crate) const COUNT_MAX: u32 = 0xffff;
