@@ -251,6 +251,7 @@ jobs:
             for f in data/perf-*.data; do
               "$PERF_BIN" report -i "$f" --no-children --sort symbol --stdio 2> /dev/null | grep -v '^#' | grep -v '^$' | head -80 > "${f%.data}.txt" || true
               "$PERF_BIN" report -i "$f" --no-children --sort dso --stdio 2> /dev/null | grep -v '^#' | grep -v '^$' | head -20 >> "${f%.data}.txt" || true
+              "$PERF_BIN" report -i "$f" --no-children --sort srcline --stdio 2> /dev/null | grep -v '^#' | grep -v '^$' | head -300 > "${f%.data}.srcline.txt" || true
               rm -f "$f"
             done
           fi
