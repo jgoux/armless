@@ -20,7 +20,9 @@
 use crate::bits::{bit, decode_bit_masks, field, sext};
 use crate::board::Host;
 use crate::cpu::{Cpu, Res};
+use crate::memstats;
 use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
+use std::sync::atomic::Ordering::Relaxed;
 
 /// Instructions in a 4 KiB page.
 pub(crate) const PAGE_INSNS: usize = 1024;
@@ -1241,6 +1243,11 @@ impl Cache {
             // SAFETY: `p` is not null (checked above) and the slot has `SLOT_OPS` (`PAGE_INSNS + 1`) ops.
             unsafe { (*p.add(PAGE_INSNS)).k = K::End };
             self.slots.push(p);
+            memstats::PREDECODE_SLOTS.store(self.slots.len() as u64, Relaxed);
+            memstats::PREDECODE_BYTES.store(
+                (self.slots.len() * SLOT_OPS * std::mem::size_of::<Op>()) as u64,
+                Relaxed,
+            );
             self.slot_page.push(NONE);
             self.referenced.push(false);
             let s = (self.slots.len() - 1) as u32;
@@ -1482,7 +1489,9 @@ mod tests {
     #[test]
     fn a_limit_in_bytes_caps_the_slots_a_cache_allocates() {
         let mut c = cpu();
-        c.jit.pre.set_limit(4 * SLOT_OPS * std::mem::size_of::<Op>());
+        c.jit
+            .pre
+            .set_limit(4 * SLOT_OPS * std::mem::size_of::<Op>());
         assert_eq!(c.jit.pre.max_slots, 4);
         for p in 0..10 {
             put(&mut c, 0x1000 * (p + 1), ADD_X0_1);

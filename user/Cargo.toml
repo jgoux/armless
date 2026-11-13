@@ -12,10 +12,14 @@ path = "src/main.rs"
 
 [dependencies]
 armless = { path = ".." }
+# The heap profiler of `--features dhat-heap` (see src/heapprof.rs)
+dhat = { version = "0.3", optional = true }
 
 [features]
 # Compile the wasm export layer (src/wasm.rs) natively, to type-check it without a wasm target.
 wasm-api = ["armless/wasm-api"]
+# armless-exec profiles the heap with dhat and writes dhat-heap.json (ARMLESS_DHAT_OUT) at exit: the peak's allocation sites.
+dhat-heap = ["dep:dhat"]
 
 [lib]
 name = "armless_user"

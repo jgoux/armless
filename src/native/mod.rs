@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -300,6 +301,7 @@ fn event_loop(
             match e {
                 Event::Blob(name) => {
                     let safe = !name.contains('/') && !name.contains("..");
+                    let fetch = crate::memstats::Timed::start(&crate::memstats::HOST_FETCH_NS);
                     let data = match &options.blob_source {
                         Some(source) => (source.0)(&name),
                         None => options
@@ -308,6 +310,10 @@ fn event_loop(
                             .filter(|_| safe)
                             .and_then(|dir| std::fs::read(dir.join(&name)).ok()),
                     };
+                    drop(fetch);
+                    crate::memstats::HOST_FETCHES.fetch_add(1, Relaxed);
+                    crate::memstats::HOST_FETCH_BYTES
+                        .fetch_add(data.as_ref().map_or(0, |d| d.len() as u64), Relaxed);
                     match data {
                         Some(d) => {
                             if board.provide_blob(&name, d).is_err() {

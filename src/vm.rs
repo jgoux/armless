@@ -130,8 +130,20 @@ impl Board {
     /// Contents for a blob the filesystem asked for (zstd or raw), or one to
     /// keep for later (preloading).
     pub fn provide_blob(&self, name: &str, data: Vec<u8>) -> Result<(), String> {
-        let mut d = self.devices.lock();
+        let mut d = {
+            let _wait = crate::memstats::Timed::start(&crate::memstats::DEV_LOCK_WAIT_NS);
+            self.devices.lock()
+        };
+        let _hold = crate::memstats::Timed::start(&crate::memstats::DEV_LOCK_HOLD_NS);
         let Some((t, p)) = d.p9() else { return Ok(()) };
+        if !crate::zstd::is_zstd(&data) {
+            // (zstd blobs are counted where they are decompressed, zstd::decompress)
+            use crate::memstats::{RAW_BLOBS, RAW_BYTES, RAW_CAPACITY};
+            use std::sync::atomic::Ordering::Relaxed;
+            RAW_BLOBS.fetch_add(1, Relaxed);
+            RAW_BYTES.fetch_add(data.len() as u64, Relaxed);
+            RAW_CAPACITY.fetch_add(data.capacity() as u64, Relaxed);
+        }
         p.fs.provide_blob(name, data)?;
         p.blob_arrived(&self.io, t, name);
         Ok(())
