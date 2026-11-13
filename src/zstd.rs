@@ -201,6 +201,22 @@ mod imp {
         StreamingDecoder::new_with_decoder(rest, dec).ok()
     }
 
+    /// Gives glibc's free memory back to the system: what a decode freed (the output's growth, the
+    /// scratch of a decoder that was replaced) stays resident in the heap otherwise, as glibc raises
+    /// its mmap threshold after the first large block is freed and serves the next ones from the heap.
+    /// Called once per `decompress` and `decompress_each`, after the frames are decoded.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn trim_heap() {
+        // SAFETY: `malloc_trim` takes no pointers, and is safe to call at any time from any thread.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+
+    /// Nothing to give back where the allocator is not glibc's.
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    fn trim_heap() {}
+
     /// Every frame of `data`, decompressed.
     pub fn decompress(data: &[u8]) -> Option<Vec<u8>> {
         use crate::memstats::{
@@ -226,7 +242,9 @@ mod imp {
                 d.read_to_end(&mut out).ok()?;
             }
             Some(out)
-        })?;
+        });
+        trim_heap();
+        let out = out?;
         // What the caller gets: its size, and what was allocated for it (read_to_end's growth leaves slack)
         ZSTD_CALLS.fetch_add(1, Relaxed);
         ZSTD_IN_BYTES.fetch_add(data.len() as u64, Relaxed);
@@ -248,7 +266,7 @@ mod imp {
     /// Every frame of `data`, decompressed, given to `sink` in pieces of at most `EACH` bytes: the
     /// decompressed contents are never all in memory (as `decompress` has them).
     pub fn decompress_each(data: &[u8], sink: &mut dyn FnMut(&[u8]) -> bool) -> Ended {
-        with_scratch(|s| {
+        let ended = with_scratch(|s| {
             let mut rest = data;
             while !rest.is_empty() {
                 let Some(mut d) = open(&mut s.dec, &mut s.primed, &mut rest) else {
@@ -264,7 +282,9 @@ mod imp {
                 }
             }
             Ended::Done
-        })
+        });
+        trim_heap();
+        ended
     }
 
     /// Native stand-in for the wasm streaming decoder: each `feed` must hold
