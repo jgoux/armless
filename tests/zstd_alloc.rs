@@ -1,5 +1,5 @@
-//! Native zstd decoding: frames decoded in a row through the thread's reused decoder come out
-//! right, and decoding allocates its big buffers once, not once per frame or call.
+//! Native zstd decoding: frames decoded in a row through a call's decoder come out right, and a
+//! call allocates its big buffers once (one window, one output), not once per frame.
 //!
 //! A counting global allocator (this test binary only) records the allocations of 64 KiB or more
 //! that the thread under test makes.
@@ -114,6 +114,11 @@ fn cases() -> Vec<Case> {
     ]
 }
 
+/// Whether `n` is the allocation of a window of `kib` KiB (ruzstd adds a byte to the size).
+fn is_window(n: usize, kib: usize) -> bool {
+    (kib << 10..=(kib << 10) + 16).contains(&n)
+}
+
 fn kib(a: &[usize]) -> Vec<usize> {
     a.iter().map(|n| n >> 10).collect()
 }
@@ -178,53 +183,88 @@ fn frames_in_a_row_decode_through_the_reused_decoder() {
 
 #[test]
 fn decoding_allocates_its_big_buffers_once() {
+    const SMALL: usize = 130 << 10;
     let cases = cases();
     let all: Vec<u8> = cases.iter().flat_map(|c| c.frame.clone()).collect();
     let total = cases.iter().map(|c| c.raw.len()).sum::<usize>();
 
-    // The first call of the thread sets the decoder up for the frame it meets first: the window
-    // (8 MiB and a block or two) in one go, the block and literals scratch growing to a block each
-    let c = &cases[0];
-    let (out, first) = large_allocs(|| zstd::decompress(&c.frame).unwrap());
-    println!("first call, {}: {:?} KiB", c.name, kib(&first));
-    assert!(out == c.raw);
-    assert!(first.len() <= 6, "{:?}", kib(&first));
-
-    // The next calls, whatever the window (none is larger), allocate the output at most
-    for i in [0, 1, 2, 3, 4, 0, 3] {
-        let c = &cases[i];
-        let (out, a) = large_allocs(|| zstd::decompress(&c.frame).unwrap());
-        println!("call {i}, {}: {:?} KiB", c.name, kib(&a));
-        assert!(out == c.raw);
-        // What is allocated is the output (all of it in one go if the header says how big it is),
-        // never a window; the block and literals scratch only ever grows to a block each
-        if i != 3 && i != 4 {
+    // Each call makes its decoder and drops it at its end, so every call allocates the window of its
+    // frame again (in one go, never as the doubling ladder of a decoder that grows it as it goes),
+    // whatever the calls before it did
+    for round in 0..2 {
+        // Sized frames: the output in one go, the window, and the block and literals scratch
+        for (i, window) in [(0, 8448), (1, 4352), (2, 128)] {
+            let c = &cases[i];
+            let (out, a) = large_allocs(|| zstd::decompress(&c.frame).unwrap());
+            println!("round {round}, {}: {:?} KiB", c.name, kib(&a));
+            assert!(out == c.raw);
             let rest: Vec<usize> = a.iter().copied().filter(|&n| n != c.raw.len()).collect();
             assert_eq!(a.len() - rest.len(), 1, "{}: {:?}", c.name, kib(&a));
-            assert!(
-                rest.len() <= 2 && rest.iter().all(|&n| n <= 130 << 10),
-                "{}: {rest:?}",
-                c.name
+            assert!(rest.len() <= 3, "{}: {:?}", c.name, kib(&a));
+            assert_eq!(
+                rest.iter().filter(|&&n| is_window(n, window)).count(),
+                1,
+                "{}: {:?}",
+                c.name,
+                kib(&a)
             );
-        } else {
-            // The output grows by doubling
             assert!(
-                a.len() <= 14 && a.iter().all(|&n| n <= 2 * c.raw.len()),
+                rest.iter().all(|&n| is_window(n, window) || n <= SMALL),
                 "{}: {:?}",
                 c.name,
                 kib(&a)
             );
         }
+
+        // Frames without a content size: one window, and the output grows by doubling
+        for i in [3, 4] {
+            let c = &cases[i];
+            let (out, a) = large_allocs(|| zstd::decompress(&c.frame).unwrap());
+            println!("round {round}, {}: {:?} KiB", c.name, kib(&a));
+            assert!(out == c.raw);
+            assert!(
+                a.len() <= 14 && a.iter().all(|&n| n <= 2 * c.raw.len().max(8448 << 10)),
+                "{}: {:?}",
+                c.name,
+                kib(&a)
+            );
+        }
+        let (_, a) = large_allocs(|| zstd::decompress(&cases[3].frame).unwrap());
+        assert_eq!(
+            a.iter().filter(|&&n| is_window(n, 8448)).count(),
+            1,
+            "{:?}",
+            kib(&a)
+        );
     }
 
-    // All the frames in one call: the output of the first, then what the rest of it makes
+    // All the frames in one call: one decoder for all of them, so one window (the first frame's,
+    // the largest), then the outputs
     let (out, a) = large_allocs(|| zstd::decompress(&all).unwrap());
     println!("all frames in one call: {:?} KiB", kib(&a));
     assert_eq!(out.len(), total);
+    assert_eq!(
+        a.iter().filter(|&&n| is_window(n, 8448)).count(),
+        1,
+        "{:?}",
+        kib(&a)
+    );
+    assert!(!a.iter().any(|&n| is_window(n, 4352)), "{:?}", kib(&a));
 
-    // In pieces the output is never allocated, so nothing is
+    // In pieces the output is never allocated: the pieces buffer, one window, the scratch
     let (ended, a) = large_allocs(|| zstd::decompress_each(&all, &mut |_| true));
     println!("all frames in pieces: {:?} KiB", kib(&a));
     assert_eq!(ended, Ended::Done);
-    assert!(a.is_empty(), "{:?}", kib(&a));
+    assert!(a.len() <= 5, "{:?}", kib(&a));
+    assert_eq!(
+        a.iter().filter(|&&n| is_window(n, 8448)).count(),
+        1,
+        "{:?}",
+        kib(&a)
+    );
+    assert!(
+        a.iter().all(|&n| is_window(n, 8448) || n <= SMALL),
+        "{:?}",
+        kib(&a)
+    );
 }

@@ -140,7 +140,6 @@ mod imp {
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
     use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
-    use std::cell::Cell;
     use std::io::Read;
 
     /// Bytes decompressed before each call of the sink of `decompress_each`, at most.
@@ -150,39 +149,27 @@ mod imp {
     /// `decompress` reserves the output for in one go.
     const PRESIZE_MAX: u64 = 1 << 30;
 
-    /// What a thread decodes with, kept between calls: ruzstd allocates its big buffers (the window,
-    /// the block and literals scratch) once per `FrameDecoder` and only resets them for the next
-    /// frame, so one decoder per thread allocates them once for all the frames the thread decodes.
+    /// What a call decodes with, made for the call and dropped at its end, so that nothing of it stays
+    /// allocated between calls: the window and the block and literals scratch of ruzstd's
+    /// `FrameDecoder` are freed with it (before the heap is trimmed), and one decoder serves all the
+    /// frames of a call, which allocates them once.
     struct Scratch {
         dec: FrameDecoder,
         /// `dec` has been through `init` once: its window is allocated at the size of a frame, in
         /// one go (a new decoder's grows by doubling, copying, while it decodes)
         primed: bool,
-        /// The pieces of `decompress_each`
+        /// The pieces of `decompress_each` (empty for `decompress`)
         piece: Vec<u8>,
     }
 
-    thread_local! {
-        static SCRATCH: Cell<Option<Box<Scratch>>> = const { Cell::new(None) };
-    }
-
-    /// `f` with this thread's decoder. A call made from within `f` (a sink that decompresses) gets a
-    /// decoder of its own, and the last one back is the one kept.
+    /// `f` with a decoder, which is dropped before this returns.
     fn with_scratch<T>(f: impl FnOnce(&mut Scratch) -> T) -> T {
-        let mut s = SCRATCH
-            .try_with(Cell::take)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| {
-                Box::new(Scratch {
-                    dec: FrameDecoder::new(),
-                    primed: false,
-                    piece: vec![0u8; EACH],
-                })
-            });
-        let r = f(&mut s);
-        let _ = SCRATCH.try_with(|c| c.set(Some(s)));
-        r
+        let mut s = Scratch {
+            dec: FrameDecoder::new(),
+            primed: false,
+            piece: Vec::new(),
+        };
+        f(&mut s)
     }
 
     /// The decoder of the frame at the start of `rest`, which it reads the header of.
@@ -202,7 +189,7 @@ mod imp {
     }
 
     /// Gives glibc's free memory back to the system: what a decode freed (the output's growth, the
-    /// scratch of a decoder that was replaced) stays resident in the heap otherwise, as glibc raises
+    /// scratch of the decoder, dropped when the call ends) stays resident in the heap otherwise, as glibc raises
     /// its mmap threshold after the first large block is freed and serves the next ones from the heap.
     /// Called once per `decompress` and `decompress_each`, after the frames are decoded.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -267,6 +254,7 @@ mod imp {
     /// decompressed contents are never all in memory (as `decompress` has them).
     pub fn decompress_each(data: &[u8], sink: &mut dyn FnMut(&[u8]) -> bool) -> Ended {
         let ended = with_scratch(|s| {
+            s.piece.resize(EACH, 0);
             let mut rest = data;
             while !rest.is_empty() {
                 let Some(mut d) = open(&mut s.dec, &mut s.primed, &mut rest) else {
