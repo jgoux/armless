@@ -1,6 +1,7 @@
 //! armless-exec: run a static aarch64 Linux ELF on armless with no guest kernel (`armless_user`),
 //! and report what the machine holds. For experiments and measurements.
 
+mod heapprof;
 mod memstats;
 
 use std::io::Write;
@@ -51,10 +52,12 @@ fn usage() -> ! {
 
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("armless-exec: {msg}");
+    heapprof::stop();
     std::process::exit(1)
 }
 
 fn main() {
+    heapprof::start();
     let start = Instant::now();
     let mut mem_mb = 1024u64;
     let mut stop_after: Option<String> = None;
@@ -150,6 +153,7 @@ fn main() {
     let ram = Ram::from_image(&file, (mem_mb << 20) as usize).unwrap_or_else(|e| die(e));
     memstats::set_ram(&ram);
     let (mut vm, _clock) = armless::runner::new_vm_on(config, Some(ram)).unwrap_or_else(|e| die(e));
+    memstats::set_board(&vm.board);
 
     if let Some(mb) = fs_cache_mb {
         vm.board.set_fs_cache(mb << 20);
@@ -235,7 +239,11 @@ fn main() {
                 match Process::exec(&mut vm.cpus[0], board.clone(), &guest_args, &env, &cwd) {
                     Ok(p) => break p,
                     Err(armless_user::ExecError::Need(_)) if start.elapsed() < timeout => {
-                        std::thread::sleep(Duration::from_millis(5))
+                        memstats::sleep(
+                            Duration::from_millis(5),
+                            &armless::memstats::EXEC_RETRIES,
+                            &armless::memstats::EXEC_RETRY_NS,
+                        )
                     },
                     Err(e) => die(e),
                 }
@@ -286,7 +294,11 @@ fn main() {
             Status::Running => {},
             Status::Idle(_) if keys.is_some() => p.input(keys.take().unwrap().as_bytes()),
             // Blobs come from the host thread soon
-            Status::Idle(_) if p.waiting_on_blobs() => std::thread::sleep(Duration::from_millis(1)),
+            Status::Idle(_) if p.waiting_on_blobs() => memstats::sleep(
+                Duration::from_millis(1),
+                &armless::memstats::BLOB_WAIT_SLEEPS,
+                &armless::memstats::BLOB_WAIT_SLEEP_NS,
+            ),
             Status::Idle(wake) => {
                 let wait = wake.map_or(Duration::from_millis(20), |w| {
                     w.saturating_duration_since(Instant::now())
@@ -340,11 +352,13 @@ fn main() {
     eprintln!("syscalls: {:?}", stats.syscalls);
     eprintln!("unknown_syscalls: {:?}", stats.unknown);
     eprintln!("opens: {:?}", stats.opens);
-    std::process::exit(match status {
+    let code = match status {
         Status::Exited(c) => c,
         Status::Fault(_) => 139,
         _ => 0,
-    })
+    };
+    heapprof::stop();
+    std::process::exit(code)
 }
 
 /// The process's physical footprint (macOS), what snowglobe measures machines by.

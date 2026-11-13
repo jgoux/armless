@@ -143,12 +143,22 @@ mod imp {
 
     /// Every frame of `data`, decompressed.
     pub fn decompress(data: &[u8]) -> Option<Vec<u8>> {
+        use crate::memstats::{
+            Timed, ZSTD_CALLS, ZSTD_IN_BYTES, ZSTD_NS, ZSTD_OUT_BYTES, ZSTD_OUT_CAPACITY,
+        };
+        use std::sync::atomic::Ordering::Relaxed;
+        let _time = Timed::start(&ZSTD_NS);
         let mut out = Vec::new();
         let mut rest = data;
         while !rest.is_empty() {
             let mut d = ruzstd::decoding::StreamingDecoder::new(&mut rest).ok()?;
             d.read_to_end(&mut out).ok()?;
         }
+        // What the caller gets: its size, and what was allocated for it (read_to_end's growth leaves slack)
+        ZSTD_CALLS.fetch_add(1, Relaxed);
+        ZSTD_IN_BYTES.fetch_add(data.len() as u64, Relaxed);
+        ZSTD_OUT_BYTES.fetch_add(out.len() as u64, Relaxed);
+        ZSTD_OUT_CAPACITY.fetch_add(out.capacity() as u64, Relaxed);
         Some(out)
     }
 

@@ -6,21 +6,26 @@
 
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use armless::memstats::{counters, exit_now, return_freed_memory, wait_termination};
+use armless::memstats::{counters, exit_now, return_freed_memory, wait_termination, COUNTERS};
+use armless::vm::Board;
 use armless::Ram;
 
-const COUNTERS: usize = 16;
+use crate::heapprof;
+
 const SAMPLE_EVERY: Duration = Duration::from_millis(100);
 const TRIM_EVERY: Duration = Duration::from_secs(1);
+/// `Fs::stats` walks every inode under the device lock, so the sampler asks for it this often.
+const FS_STATS_EVERY: Duration = Duration::from_secs(1);
 
 static TRIM: AtomicBool = AtomicBool::new(false);
 static DONE: AtomicBool = AtomicBool::new(false);
 static RAM_START: AtomicU64 = AtomicU64::new(0);
 static RAM_LEN: AtomicU64 = AtomicU64::new(0);
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+static BOARD: Mutex<Option<Arc<Board>>> = Mutex::new(None);
 
 /// PSS in KiB, by group of mappings.
 #[derive(Clone, Copy, Default)]
@@ -50,27 +55,39 @@ struct State {
 /// ends the process. Called before any other thread exists, so every one blocks the signals.
 pub fn init(memstats: bool, trim: bool, start: Instant) {
     TRIM.store(trim, Relaxed);
-    if !memstats && !trim {
+    if !memstats && !trim && !heapprof::ENABLED {
         return;
     }
-    if memstats {
+    if memstats || heapprof::ENABLED {
         armless::memstats::block_termination();
-        *STATE.lock().unwrap() = Some(State {
-            start,
-            peak: None,
-            max: [0; COUNTERS],
-        });
+        if memstats {
+            *STATE.lock().unwrap() = Some(State {
+                start,
+                peak: None,
+                max: [0; COUNTERS],
+            });
+        }
         std::thread::spawn(|| {
             let sig = wait_termination();
             finish();
+            // The heap profile is written now, as at a normal exit (it waits for one that is being written)
+            heapprof::stop();
             exit_now(128 + sig);
         });
     }
+    if !memstats && !trim {
+        return;
+    }
     std::thread::spawn(move || {
         let mut trimmed = Instant::now();
+        let mut fs_stats = Instant::now();
         loop {
             std::thread::sleep(SAMPLE_EVERY);
             if memstats {
+                if fs_stats.elapsed() >= FS_STATS_EVERY {
+                    refresh_fs_stats();
+                    fs_stats = Instant::now();
+                }
                 sample();
             }
             if trim && trimmed.elapsed() >= TRIM_EVERY {
@@ -79,6 +96,32 @@ pub fn init(memstats: bool, trim: bool, start: Instant) {
             }
         }
     });
+}
+
+/// The machine, whose file system `refresh_fs_stats` reads.
+pub fn set_board(board: &Arc<Board>) {
+    *BOARD.lock().unwrap() = Some(board.clone());
+}
+
+/// Sleeps, and counts the sleep and its time (what it took, not what was asked for).
+pub fn sleep(d: Duration, count: &AtomicU64, ns: &AtomicU64) {
+    let t = Instant::now();
+    std::thread::sleep(d);
+    count.fetch_add(1, Relaxed);
+    ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+}
+
+/// What the guest wrote into the file system (buffers, bytes, allocated capacity), into the counters.
+fn refresh_fs_stats() {
+    let Some(board) = BOARD.lock().unwrap().clone() else {
+        return;
+    };
+    if let Some(s) = board.with_fs(|fs| fs.stats()) {
+        use armless::memstats::{FS_WRITTEN_BUFFERS, FS_WRITTEN_BYTES, FS_WRITTEN_CAPACITY};
+        FS_WRITTEN_BUFFERS.store(s.written_buffers as u64, Relaxed);
+        FS_WRITTEN_BYTES.store(s.written_bytes as u64, Relaxed);
+        FS_WRITTEN_CAPACITY.store(s.written_capacity as u64, Relaxed);
+    }
 }
 
 /// The guest RAM's mapping, which `ram` is the PSS of.
@@ -95,6 +138,7 @@ pub fn trim() {
 }
 
 pub fn ready() {
+    refresh_fs_stats();
     if let Some(s) = sample() {
         eprintln!("memstats ready {}", json(&s, None));
     }
@@ -105,6 +149,7 @@ pub fn finish() {
     if STATE.lock().unwrap().is_none() || DONE.swap(true, Relaxed) {
         return;
     }
+    refresh_fs_stats();
     sample();
     let st = STATE.lock().unwrap();
     if let Some(State {
