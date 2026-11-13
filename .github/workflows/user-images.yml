@@ -42,6 +42,9 @@ on:
       host_env:
         description: "environment of armless-exec itself, space-separated KEY=VALUE (e.g. ARMLESS_JIT=native); the guest's is set with --env in exec_args"
         default: ""
+      perf:
+        description: "set (e.g. 1): each start runs under `perf record` (host CPU profile of armless-exec, line tables kept); the cell artifact gets perf-*.txt"
+        default: ""
       features:
         description: "cargo features of the armless-exec build, comma-separated (e.g. dhat-heap: a heap profile of the untraced start of each cell)"
         default: ""
@@ -112,6 +115,7 @@ jobs:
     timeout-minutes: 40
     env:
       FEATURES: ${{ inputs.features }}
+      PERF: ${{ inputs.perf }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -125,13 +129,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "armless-src -> build"
-          key: ${{ inputs.features }}
+          key: ${{ inputs.features }}${{ inputs.perf && '-perf' || '' }}
       - name: armless-exec
         working-directory: armless-src
         run: |
           flags=()
           if [ -n "$FEATURES" ]; then flags+=(--features "$FEATURES"); fi
           case ",$FEATURES," in *,dhat-heap,*) export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only ;; esac
+          if [ -n "$PERF" ]; then export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only; fi
           cargo build --release -p armless-user --bin armless-exec "${flags[@]}"
           mkdir -p ../bin
           cp build/release/armless-exec ../bin/
@@ -218,15 +223,37 @@ jobs:
           READY_TIMEOUT: ${{ inputs.ready_timeout || '300' }}
           FEATURES: ${{ inputs.features }}
           HOST_ENV: ${{ inputs.host_env }}
+          PERF: ${{ inputs.perf }}
         run: |
           set -o pipefail
           for kv in $HOST_ENV; do export "$kv"; done
+          exe="$PWD/bin/armless-exec"
+          if [ -n "$PERF" ]; then
+            sudo apt-get update -qq > /dev/null
+            sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" > /dev/null \
+              || sudo apt-get install -y -qq linux-tools-common linux-tools-generic > /dev/null
+            PERF_BIN=$(ls /usr/lib/linux-tools/*/perf | head -1)
+            "$PERF_BIN" --version
+            sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+            mkdir -p data
+            # perf record ends on the harness's SIGTERM, stops armless-exec and writes its file
+            printf '#!/bin/sh\nexec "%s" record -q -F 999 -o "%s/perf-$$.data" -- "%s" "$@"\n' "$PERF_BIN" "$PWD/data" "$exe" > bin/armless-exec-perf
+            chmod +x bin/armless-exec-perf
+            exe="$PWD/bin/armless-exec-perf"
+          fi
           mkdir -p data
           extra=()
           for a in $EXEC_ARGS; do extra+=("--exec-arg=$a"); done
           case ",$FEATURES," in *,dhat-heap,*) extra+=(--dhat) ;; esac
-          python3 -I $IMAGES/harness.py cell --image ${{ matrix.image }} --fs "$PWD/pkg" --armless-exec "$PWD/bin/armless-exec" --out data \
+          python3 -I $IMAGES/harness.py cell --image ${{ matrix.image }} --fs "$PWD/pkg" --armless-exec "$exe" --out data \
             --ready-timeout "$READY_TIMEOUT" "${extra[@]}" 2>&1 | tee data/harness.log
+          if [ -n "$PERF" ]; then
+            for f in data/perf-*.data; do
+              "$PERF_BIN" report -i "$f" --no-children --sort symbol --stdio 2> /dev/null | grep -v '^#' | grep -v '^$' | head -80 > "${f%.data}.txt" || true
+              "$PERF_BIN" report -i "$f" --no-children --sort dso --stdio 2> /dev/null | grep -v '^#' | grep -v '^$' | head -20 >> "${f%.data}.txt" || true
+              rm -f "$f"
+            done
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
