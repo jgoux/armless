@@ -16,6 +16,8 @@
 # Dispatch (the `ref` input is the list: comma-separated, merged in order; a ref is a branch, tag or sha of this fork, or `upstream:<ref>`):
 #   gh workflow run user-images.yml -R jgoux/armless --ref ci/user-images -f ref=main
 #   gh workflow run user-images.yml -R jgoux/armless --ref ci/user-images -f ref=feat/user-sockets,feat/user-processes
+# `host_env` sets the environment of armless-exec itself (the harness hands it its own), e.g. the native JIT:
+#   gh workflow run user-images.yml -R jgoux/armless --ref ci/user-images -f ref=exp/user-jit -f host_env=ARMLESS_JIT=native -f exec_args="--memstats"
 # A push to ci/user-images runs the refs of .github/user-images/REFS.
 #
 # Where the host heap goes (a ref with `--memstats` and the dhat-heap feature, e.g. diag/exec-memstats): `features` is passed to the armless-exec build
@@ -37,6 +39,9 @@ on:
       ready_timeout:
         description: "seconds an image gets to become ready"
         default: "300"
+      host_env:
+        description: "environment of armless-exec itself, space-separated KEY=VALUE (e.g. ARMLESS_JIT=native); the guest's is set with --env in exec_args"
+        default: ""
       features:
         description: "cargo features of the armless-exec build, comma-separated (e.g. dhat-heap: a heap profile of the untraced start of each cell)"
         default: ""
@@ -212,8 +217,10 @@ jobs:
           EXEC_ARGS: ${{ inputs.exec_args }}
           READY_TIMEOUT: ${{ inputs.ready_timeout || '300' }}
           FEATURES: ${{ inputs.features }}
+          HOST_ENV: ${{ inputs.host_env }}
         run: |
           set -o pipefail
+          for kv in $HOST_ENV; do export "$kv"; done
           mkdir -p data
           extra=()
           for a in $EXEC_ARGS; do extra+=("--exec-arg=$a"); done
