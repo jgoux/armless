@@ -82,6 +82,40 @@ impl Ram {
         }
     }
 
+    /// RAM on a private anonymous mapping of its own, reserved but not committed: every page reads
+    /// as zero and holds no host memory until the guest writes it (a read maps the kernel's one
+    /// zero page), and `discard` can always map fresh pages over a range, macOS included, since
+    /// no allocator owns it.
+    #[cfg(unix)]
+    pub fn mapped(len: usize) -> std::io::Result<Ram> {
+        if len == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "RAM of 0 bytes"));
+        }
+        // SAFETY: a new anonymous mapping at an address the kernel picks; nothing else owns that
+        // range, and `drop` unmaps it once.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Ram {
+            ptr: ptr.cast(),
+            len,
+            alloc: None,
+            mapped: true,
+            image: false,
+            fresh: Arc::new(AtomicBool::new(true)),
+        })
+    }
+
     /// RAM whose pages are an image's: `file` holds RAM as it is, `len` bytes, with holes where it
     /// is zero (`split_state` writes one). It is mapped copy-on-write, private to this RAM:
     /// machines made from one image share the pages none of them writes (the host's page cache),
@@ -387,7 +421,7 @@ impl Drop for Ram {
         }
         #[cfg(unix)]
         if self.mapped {
-            // SAFETY: the mapping `from_image` made, unmapped once (aliases have none).
+            // SAFETY: the mapping `mapped` or `from_image` made, unmapped once (aliases have none).
             unsafe { libc::munmap(self.ptr.cast(), self.len) };
         }
     }

@@ -136,8 +136,8 @@ fn main() {
 
     memstats::init(want_memstats, trim, start);
 
-    // RAM on a private mapping of a sparse file (all holes, so all zero), not calloc's: the
-    // process can then give the host back the pages the program unmaps.
+    // RAM on an anonymous mapping of its own, not calloc's: the process can then give the host
+    // back the pages the program unmaps, and pages it never writes cost nothing.
     let config = Config {
         memory_size: (mem_mb << 20) as usize,
         cpus,
@@ -148,17 +148,7 @@ fn main() {
             ..Default::default()
         },
     };
-    let backing = std::env::temp_dir().join(format!("armless-exec-{}.ram", std::process::id()));
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&backing)
-        .unwrap_or_else(|e| die(e));
-    file.set_len(mem_mb << 20).unwrap_or_else(|e| die(e));
-    let _ = std::fs::remove_file(&backing);
-    let ram = Ram::from_image(&file, (mem_mb << 20) as usize).unwrap_or_else(|e| die(e));
+    let ram = Ram::mapped((mem_mb << 20) as usize).unwrap_or_else(|e| die(e));
     memstats::set_ram(&ram);
     let (mut vm, _clock) = armless::runner::new_vm_on(config, Some(ram)).unwrap_or_else(|e| die(e));
     memstats::set_board(&vm.board);
