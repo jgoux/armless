@@ -59,6 +59,18 @@ pub static FS_WRITTEN_BUFFERS: AtomicU64 = AtomicU64::new(0);
 pub static FS_WRITTEN_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static FS_WRITTEN_CAPACITY: AtomicU64 = AtomicU64::new(0);
 
+/// Native JIT, summed over the CPUs: bytes of compiled code in the current modules, functions
+/// compiled, and nanoseconds spent compiling them (0 without the native JIT).
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-jit"))]
+fn jit_totals() -> (u64, u64, u64) {
+    crate::jit::native::totals()
+}
+
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "native-jit")))]
+fn jit_totals() -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
 /// Adds the time between its making and its drop to a counter (nothing on wasm32: no clock).
 pub struct Timed {
     #[cfg(not(target_arch = "wasm32"))]
@@ -91,11 +103,12 @@ impl Drop for Timed {
 }
 
 /// The number of counters `counters` lists.
-pub const COUNTERS: usize = 38;
+pub const COUNTERS: usize = 41;
 
 /// The counters, named, as one list (glibc's `mallinfo2` fields come last, 0 elsewhere).
 pub fn counters() -> [(&'static str, u64); COUNTERS] {
     let m = mallinfo();
+    let j = jit_totals();
     [
         ("fs_cache_bytes", FS_CACHE_BYTES.load(Relaxed)),
         ("fs_cache_peak", FS_CACHE_PEAK.load(Relaxed)),
@@ -131,6 +144,9 @@ pub fn counters() -> [(&'static str, u64); COUNTERS] {
         ("fs_written_buffers", FS_WRITTEN_BUFFERS.load(Relaxed)),
         ("fs_written_bytes", FS_WRITTEN_BYTES.load(Relaxed)),
         ("fs_written_capacity", FS_WRITTEN_CAPACITY.load(Relaxed)),
+        ("jit_code_bytes", j.0),
+        ("jit_compiled", j.1),
+        ("jit_compile_ns", j.2),
         ("malloc_arena", m[0]),
         ("malloc_uordblks", m[1]),
         ("malloc_fordblks", m[2]),

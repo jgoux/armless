@@ -647,6 +647,10 @@ impl Process {
             }
         });
         let mut frames = mm::Frames::new(ram.alias(), purge);
+        // This process's frames are new: the ones a process before it left in this RAM are not
+        // purged one by one, so what the CPUs compiled or decoded from them goes all at once
+        // (u32::MAX is smp::CODE_ALL)
+        cpu.machine.invalidate_code(u32::MAX, usize::MAX);
         let mm = layout.space(&mut frames)?;
         let mut p = Process {
             ram,
@@ -1437,6 +1441,10 @@ impl Process {
             }
         });
         let mut frames = mm::Frames::new(ram.alias(), purge);
+        // This process's frames are new: the ones a process before it left in this RAM are not
+        // purged one by one, so what the CPUs compiled or decoded from them goes all at once
+        // (u32::MAX is smp::CODE_ALL)
+        cpu.machine.invalidate_code(u32::MAX, usize::MAX);
         frames.load(&mut r)?;
         let _asid = r.u()?;
         let filled = r.u()?;

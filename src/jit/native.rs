@@ -185,6 +185,32 @@ struct Shared {
     later: Mutex<VecDeque<Job>>,
 }
 
+/// The `Shared` of every live native JIT, for `--memstats` (`totals`).
+static REGISTRY: Mutex<Vec<std::sync::Weak<Shared>>> = Mutex::new(Vec::new());
+
+fn new_shared() -> Arc<Shared> {
+    let shared = Arc::new(Shared::default());
+    let mut all = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    all.retain(|w| w.strong_count() > 0);
+    all.push(Arc::downgrade(&shared));
+    shared
+}
+
+/// Over every live native JIT (one per CPU): bytes of compiled code in the current modules,
+/// functions compiled, and nanoseconds spent compiling them.
+pub fn totals() -> (u64, u64, u64) {
+    let all = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    all.iter()
+        .filter_map(|w| w.upgrade())
+        .fold((0, 0, 0), |(b, c, ns), s| {
+            (
+                b + s.code_bytes.load(Ordering::Relaxed) as u64,
+                c + s.compiles.load(Ordering::Relaxed),
+                ns + s.compile_ns.load(Ordering::Relaxed),
+            )
+        })
+}
+
 /// One CPU's native JIT: a compiler thread of its own owns the generated code, so the CPU goes on
 /// interpreting while a page compiles, and takes the result when it is there (as in the browser,
 /// where the host compiles asynchronously too).
@@ -235,7 +261,7 @@ impl Native {
     /// functions `gen` writes for this CPU.
     pub fn new(locals: &'static [(u32, u8)], helpers: Helpers) -> Option<Native> {
         let (done_tx, done) = channel::<Done>();
-        let shared = Arc::new(Shared::default());
+        let shared = new_shared();
         let (jobs, thread) = spawn(locals, helpers, shared.clone(), done_tx)?;
         Some(Native {
             jobs: Some(jobs),
@@ -258,7 +284,7 @@ impl Native {
         Some(Native {
             jobs: None,
             done,
-            shared: Arc::new(Shared::default()),
+            shared: new_shared(),
             generation: 0,
             thread: None,
             here: Some((compiler, done_tx)),
