@@ -698,27 +698,8 @@ impl Compiler {
         if std::mem::take(&mut self.scratch) {
             self.ctx = self.module.make_context();
             self.fctx = FunctionBuilderContext::new();
-            return_freed_memory();
+            crate::memstats::return_freed_memory();
         }
-    }
-}
-
-/// Hands memory the allocator holds free back to the system: malloc keeps the pages of what is
-/// freed, and counts them as the process's, until asked.
-#[allow(unsafe_code)]
-fn return_freed_memory() {
-    #[cfg(target_os = "macos")]
-    {
-        unsafe extern "C" {
-            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
-        }
-        // SAFETY: a null zone means every zone; a zero goal, as much as it can.
-        unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
-    }
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    // SAFETY: only returns free memory to the system.
-    unsafe {
-        libc::malloc_trim(0);
     }
 }
 

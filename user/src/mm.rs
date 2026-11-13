@@ -31,9 +31,11 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::Ordering::Relaxed;
 
 use armless::cpu::Cpu;
 use armless::dev::fs::Ino;
+use armless::memstats;
 use armless::{Host, Ram};
 
 use crate::elf::Seg;
@@ -144,6 +146,7 @@ impl Frames {
         };
         self.refs[f as usize] = 1;
         self.live += 1;
+        memstats::FRAMES_LIVE.store(self.live, Relaxed);
         Some(f * PAGE)
     }
 
@@ -157,6 +160,7 @@ impl Frames {
         if *r == 0 {
             self.dying.push(pa / PAGE);
             self.live -= 1;
+            memstats::FRAMES_LIVE.store(self.live, Relaxed);
         }
     }
 
@@ -1081,6 +1085,8 @@ impl Process {
             };
             if !data.is_empty() {
                 self.ram.write(pa as usize, &data);
+                memstats::POPULATE_FAULTS.fetch_add(1, Relaxed);
+                memstats::POPULATE_BYTES.fetch_add(data.len() as u64, Relaxed);
             }
             if !mm.set(&mut f, page, pa | bits(vma.prot, true)) {
                 f.decref(pa);

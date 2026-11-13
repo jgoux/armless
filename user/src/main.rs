@@ -1,6 +1,8 @@
 //! armless-exec: run a static aarch64 Linux ELF on armless with no guest kernel (`armless_user`),
 //! and report what the machine holds. For experiments and measurements.
 
+mod memstats;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,6 +38,12 @@ fn usage() -> ! {
                      a TCP connection to it (tcp://HOST:PORT) instead (repeatable; needs --net)
   --allow-private    let the program reach loopback, private and link-local addresses at
                      this host (a local tunnel endpoint, say)
+  --memstats         sample where the process's memory goes (PSS by mapping, the machine's counters)
+                     every 100 ms; stderr gets `memstats ready {{json}}` and, at the end or on
+                     SIGTERM, `memstats peak {{json}}`
+  --fs-cache-mb N    the most decompressed file content the filesystem keeps (default 256)
+  --trim             give the allocator's free memory back to the system after fs.json is read,
+                     once the program is ready and every second
   ARMLESS_EXEC_TRACE=1 prints every syscall"
     );
     std::process::exit(2)
@@ -62,6 +70,9 @@ fn main() {
     let mut publish: Vec<(String, u16)> = Vec::new();
     let mut tunnels = Vec::new();
     let mut allow_private = false;
+    let mut want_memstats = false;
+    let mut fs_cache_mb: Option<usize> = None;
+    let mut trim = false;
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.peek().cloned() {
         if !a.starts_with('-') {
@@ -92,6 +103,9 @@ fn main() {
                 tunnels.push(armless::native::Tunnel::parse(&val()).unwrap_or_else(|| usage()))
             },
             "--allow-private" => allow_private = true,
+            "--memstats" => want_memstats = true,
+            "--fs-cache-mb" => fs_cache_mb = Some(val().parse().unwrap_or_else(|_| usage())),
+            "--trim" => trim = true,
             "--env" => env.push(val()),
             "--keys" => {
                 keys = Some(
@@ -108,6 +122,8 @@ fn main() {
     if guest_args.is_empty() == restore.is_none() {
         usage();
     }
+
+    memstats::init(want_memstats, trim, start);
 
     // RAM on a private mapping of a sparse file (all holes, so all zero), not calloc's: the
     // process can then give the host back the pages the program unmaps.
@@ -132,8 +148,12 @@ fn main() {
     file.set_len(mem_mb << 20).unwrap_or_else(|e| die(e));
     let _ = std::fs::remove_file(&backing);
     let ram = Ram::from_image(&file, (mem_mb << 20) as usize).unwrap_or_else(|e| die(e));
+    memstats::set_ram(&ram);
     let (mut vm, _clock) = armless::runner::new_vm_on(config, Some(ram)).unwrap_or_else(|e| die(e));
 
+    if let Some(mb) = fs_cache_mb {
+        vm.board.set_fs_cache(mb << 20);
+    }
     // The filesystem, its blobs served from the directory by armless's native host
     let mut host: Option<Arc<armless::native::NativeHost>> = None;
     let blobs = fs_dir.as_ref().and_then(|dir| {
@@ -151,6 +171,7 @@ fn main() {
         vm.board
             .load_filesystem(&std::fs::read(&json).unwrap_or_else(|e| die(e)))
             .unwrap_or_else(|e| die(e));
+        memstats::trim();
     }
     // The host's side of the machine: its blobs, its network
     if fs_dir.is_some() || net {
@@ -228,6 +249,8 @@ fn main() {
         },
     };
     let ready = start.elapsed();
+    memstats::trim();
+    memstats::ready();
     p.trace = std::env::var_os("ARMLESS_EXEC_TRACE").is_some();
     // The line, and its echo, which isn't the answer waited for
     let mut printed = Vec::new();
@@ -278,6 +301,7 @@ fn main() {
         }
     };
     p.park(cpu);
+    memstats::finish();
     let insns = cpu.insn_count;
     let footprint = footprint();
     let threads = p.threads();

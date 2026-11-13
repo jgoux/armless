@@ -7,9 +7,11 @@
 //! the chunks they cover, and writes copy only the chunks they touch.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
 use super::json::{self, Json};
+use crate::memstats;
 use crate::ser::{R, W};
 
 pub type Ino = u64;
@@ -303,13 +305,15 @@ impl Fs {
     }
 
     fn alloc(&mut self, inode: Inode) -> Ino {
-        if let Some(i) = self.free.pop() {
+        let ino = if let Some(i) = self.free.pop() {
             self.inodes[i as usize] = Some(inode);
             i
         } else {
             self.inodes.push(Some(inode));
             (self.inodes.len() - 1) as Ino
-        }
+        };
+        memstats::FS_INODES.store((self.inodes.len() - self.free.len()) as u64, Relaxed);
+        ino
     }
 
     pub fn get(&self, ino: Ino) -> Option<&Inode> {
@@ -489,6 +493,7 @@ impl Fs {
             if i.nlink == 0 && i.refs == 0 {
                 self.inodes[ino as usize] = None;
                 self.free.push(ino);
+                memstats::FS_INODES.store((self.inodes.len() - self.free.len()) as u64, Relaxed);
             }
         }
     }
@@ -930,9 +935,12 @@ impl Fs {
             return Ok(());
         }
         self.cached += raw.len();
+        memstats::FS_BYTES_IN.fetch_add(raw.len() as u64, Relaxed);
+        memstats::FS_FETCHES.fetch_add(1, Relaxed);
         self.blobs.insert(name.to_string(), Arc::new(raw));
         self.order.push_back(name.to_string());
         self.evict();
+        memstats::FS_CACHE_PEAK.fetch_max(self.cached as u64, Relaxed);
         Ok(())
     }
 
@@ -987,11 +995,19 @@ impl Fs {
                 kept.push(old);
             } else if let Some(b) = self.blobs.remove(&old) {
                 self.cached -= b.len();
+                memstats::FS_EVICTIONS.fetch_add(1, Relaxed);
             }
         }
         while let Some(n) = kept.pop() {
             self.order.push_front(n);
         }
+        self.note_cache();
+    }
+
+    /// What the cache holds now, for `memstats`.
+    fn note_cache(&self) {
+        memstats::FS_CACHE_BYTES.store(self.cached as u64, Relaxed);
+        memstats::FS_CACHE_ENTRIES.store(self.blobs.len() as u64, Relaxed);
     }
 
     pub fn blob_failed(&mut self, name: &str) {
@@ -1010,6 +1026,7 @@ impl Fs {
         self.order.clear();
         self.cached = 0;
         self.pinned.clear();
+        self.note_cache();
     }
 
     /// The blob a file's contents are in, if they are still unmodified.
@@ -1103,6 +1120,7 @@ impl Fs {
             }
             self.pinned.remove(&n);
         }
+        self.note_cache();
     }
 
     pub fn statfs(&self) -> (u64, u64) {

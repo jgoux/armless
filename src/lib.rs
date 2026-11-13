@@ -15,7 +15,7 @@
 )]
 // `unsafe` lives where nothing else will do, and says why it is sound: guest RAM (`ram`), the
 // spinlock (`smp`), the decoded-page cache (`predecode`), a CPU's own pointers (`cpu`), running
-// compiled code and its memory (`jit`), and the boundaries with C and JavaScript (`zstd`, `wasm`).
+// compiled code and its memory (`jit`), and the boundaries with C and JavaScript (`zstd`, `wasm`), and the process's own calls to libc (`memstats`).
 // Anywhere else it does not compile; each allowance below is where it may.
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -36,6 +36,8 @@ pub(crate) mod gic;
 pub(crate) mod heap;
 pub mod jit;
 pub(crate) mod kernel;
+#[allow(unsafe_code)]
+pub mod memstats;
 pub(crate) mod mmu;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native;
