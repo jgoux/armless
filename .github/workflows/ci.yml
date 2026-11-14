@@ -4,7 +4,7 @@ name: ci
 # every job a second time. main still runs on push: its own result, and the cache pull requests restore.
 on:
   push:
-    branches: [main]
+    branches: [main, ci/restore-asleep]
   pull_request:
   workflow_dispatch:
 
