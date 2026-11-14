@@ -167,6 +167,14 @@ pub extern "C" fn armless_user_resize(cols: u32, rows: u32) {
     PROCESS.with_borrow_mut(|p| p.as_mut().map(|p| p.resize(cols as u16, rows as u16)));
 }
 
+/// Whether the first process reaps its orphans (`Process::reap_orphans`: a program that is pid 1 of
+/// a container). Call it after `armless_user_exec` and before the first `armless_user_run`; a
+/// restored process keeps what it was saved with.
+#[no_mangle]
+pub extern "C" fn armless_user_reap_orphans(on: u32) {
+    PROCESS.with_borrow_mut(|p| p.as_mut().map(|p| p.reap_orphans = on != 0));
+}
+
 /// A signal for the process (`Process::kill`), as `kill(2)` sends it: SIGINT (2) when a page's
 /// stop button interrupts the program without going through the terminal.
 #[no_mangle]

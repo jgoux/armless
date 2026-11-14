@@ -13,7 +13,7 @@
 //
 // User mode (no guest kernel): a Linux program from the filesystem runs on the machine's CPU
 // and its system calls are answered in armless, with the console as its terminal. Instead of
-// `boot`, `user: { argv: ["python3"], env: ["PATH=/usr/bin", ...], cwd: "/", cols, rows }`
+// `boot`, `user: { argv: ["python3"], env: ["PATH=/usr/bin", ...], cwd: "/", cols, rows, reap_orphans }`
 // starts one; `user_state` (URL or bytes, a process saved with save_process() or natively,
 // system/user.bin of a snowglobe site) restores one next to `initial_state`. The events and
 // console_input/console_resize are the same; "stop" says {reason: "exit", code} when it exits,
@@ -683,7 +683,7 @@
 
     // ------------------------------------------------------------ user mode
 
-    /** Start a program from the filesystem with no kernel: { argv, env, cwd, cols, rows }. */
+    /** Start a program from the filesystem with no kernel: { argv, env, cwd, cols, rows, reap_orphans }. */
     async _user_exec(user) {
       const e = this.exports;
       const argv = typeof user.argv === "string" ? [user.argv] : user.argv || [];
@@ -705,6 +705,7 @@
         ptrs.forEach((p, i) => e.armless_free(p, parts[i].length));
       }
       this.user = true;
+      if (user.reap_orphans) e.armless_user_reap_orphans(1);
       e.armless_user_resize(user.cols || 80, user.rows || 24);
     }
 

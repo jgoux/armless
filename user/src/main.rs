@@ -29,6 +29,8 @@ fn usage() -> ! {
   --save DIR         when it stops, write the machine (machine.bin) and the process (process.bin)
   --restore DIR      start from what --save wrote instead of an ELF
   --input LINE       type LINE (and a newline) into its stdin, and stop at the next line it prints
+  --reap-orphans     reap the processes whose parent ended, as a container's pid 1 does: their
+                     statuses are not the program's to wait for, and they leave as they end
   --timeout SECS     stop after SECS of wall time
   --net              a network: connections to addresses that are not the loopback's are made
                      from here, and what the program listens on can be published
@@ -67,6 +69,7 @@ fn main() {
     let mut publish: Vec<(String, u16)> = Vec::new();
     let mut tunnels = Vec::new();
     let mut allow_private = false;
+    let mut reap_orphans = false;
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.peek().cloned() {
         if !a.starts_with('-') {
@@ -103,6 +106,7 @@ fn main() {
                 tunnels.push(armless::native::Tunnel::parse(&val()).unwrap_or_else(|| usage()))
             },
             "--allow-private" => allow_private = true,
+            "--reap-orphans" => reap_orphans = true,
             "--env" => env.push(val()),
             "--spawn" => spawn = Some(val()),
             "--keys" => {
@@ -230,6 +234,7 @@ fn main() {
         },
     };
     let ready = start.elapsed();
+    p.reap_orphans |= reap_orphans;
     p.trace = std::env::var_os("ARMLESS_EXEC_TRACE").is_some();
     // ARMLESS_EXEC_TRACE_NR=129,131,133: only those system calls
     if let Ok(nrs) = std::env::var("ARMLESS_EXEC_TRACE_NR") {
