@@ -1,0 +1,53 @@
+# User mode's tests (the `core` job of ci.yml, for armless-user only) on any ref of this fork, for branches
+# that ci.yml doesn't run (it runs on pull requests and main). For this fork only, never for upstream.
+#   gh workflow run execopts-tests.yml -R jgoux/armless --ref ci/execopts-tests -f ref=fix/user-exec-empty-args
+name: execopts-tests
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "branch, tag or sha of this fork to test"
+        required: true
+  push:
+    branches: [ci/execopts-tests]
+
+jobs:
+  core:
+    name: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Toolchain
+        run: |
+          sudo apt-get install -y clang lld llvm
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          rustup target add wasm32-unknown-unknown
+          rustup component add rust-src clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> build"
+          save-if: false
+      - name: User mode's tests
+        run: cargo test --release -p armless-user
+      - name: User mode's tests with overflow checks
+        run: cargo test -p armless-user
+      - name: User mode on several CPUs
+        run: ARMLESS_TEST_CPUS=4 cargo test --release -p armless-user
+      - name: The wasm layer, natively, and its tests
+        run: |
+          cargo check -p armless-user --features wasm-api
+          cargo test -p armless-user --features wasm-api --lib wasm::
+      - name: Lints
+        run: |
+          cargo clippy --release --all-targets --features wasm-api --workspace
+          cargo clippy -p armless-user --lib --target wasm32-unknown-unknown --features wasm-api
