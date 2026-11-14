@@ -577,3 +577,117 @@ fn what_the_guest_wrote_before_closing_reaches_a_tunnels_far_side() {
     assert_eq!(next(), (ws::BINARY, b"the last words".to_vec()));
     assert_eq!(next().0, ws::CLOSE);
 }
+
+/// What the host keeps for connections (the flags, sockets, tunnels), once there are none left.
+fn untracked(host: &NativeHost) {
+    until("the host to forget its connections", || {
+        (host.conns.lock().unwrap().tracked() == 0).then_some(())
+    });
+}
+
+#[test]
+fn what_the_host_keeps_for_closed_connections_goes_with_them() {
+    const N: u16 = 64;
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    // Every connection the host makes must end: its socket closed, not left in a table
+    let (eof_tx, eof_rx) = mpsc::channel();
+    thread::spawn(move || {
+        for _ in 0..N {
+            let (mut s, _) = l.accept().unwrap();
+            let eof_tx = eof_tx.clone();
+            thread::spawn(move || {
+                let mut sink = Vec::new();
+                let _ = s.read_to_end(&mut sink);
+                let _ = eof_tx.send(());
+            });
+        }
+    });
+    let b = board(true);
+    let (obs, seen) = observer();
+    let host = NativeHost::spawn(b.clone(), options(true), obs);
+    let mut g = Guest::on_board(b.clone());
+    let ip = g.resolve("localhost", 1).unwrap();
+    for i in 0..N {
+        let sport = 41000 + i;
+        g.syn(ip, sport, port);
+        if i % 2 == 0 {
+            // Reset once the connection is up
+            let sa = seg(&mut g, "the SYN-ACK", |s| {
+                s.has(SYN | ACK) && s.dport == sport
+            });
+            let theirs = sa.seq.wrapping_add(1);
+            g.ack(ip, sport, port, theirs);
+            g.rst(ip, sport, port, theirs);
+        } else {
+            // Reset before the host has connected, perhaps before its thread has started: the
+            // close comes first, and the socket the thread makes after it must not be kept
+            g.rst(ip, sport, port, 0);
+        }
+    }
+    for _ in 0..N {
+        eof_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a host socket was kept open after the guest closed its connection");
+    }
+    until("every close", || {
+        let closed = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, Event::TcpClosed { .. }))
+            .count();
+        (closed == N as usize).then_some(())
+    });
+    untracked(&host);
+}
+
+#[test]
+fn a_request_stops_when_the_guest_closes_its_connection_and_leaves_nothing_kept() {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    // A response nobody can finish reading (a terabyte): the server writes until it can't
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            s.read_exact(&mut b).unwrap();
+            head.push(b[0]);
+        }
+        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1099511627776\r\n\r\n")
+            .unwrap();
+        let chunk = [7u8; 64 * 1024];
+        let _ = done_tx.send(loop {
+            if let Err(e) = s.write_all(&chunk) {
+                break e;
+            }
+        });
+    });
+    let b = board(true);
+    let (obs, _) = observer();
+    let host = NativeHost::spawn(b.clone(), options(true), obs);
+    let mut g = Guest::on_board(b.clone());
+    let ip = g.resolve("localhost", 1).unwrap();
+    g.syn(ip, 42000, 80);
+    let sa = seg(&mut g, "the SYN-ACK", |s| s.has(SYN | ACK));
+    let theirs = sa.seq.wrapping_add(1);
+    g.ack(ip, 42000, 80, theirs);
+    g.data(
+        ip,
+        42000,
+        80,
+        theirs,
+        format!("GET /big HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes(),
+    );
+    // The guest takes nothing: the host's thread waits for it, holding the response open
+    seg(&mut g, "the response", |s| !s.payload.is_empty());
+    thread::sleep(Duration::from_millis(500));
+    assert!(done_rx.try_recv().is_err(), "the server was still writing");
+    g.rst(ip, 42000, 80, theirs);
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the host kept reading the response after the guest closed");
+    untracked(&host);
+}
