@@ -59,6 +59,9 @@ impl<T> Got<T> {
 pub(crate) enum Kind {
     /// The terminal (stdin, stdout, stderr, /dev/tty)
     Tty,
+    /// Standard output or error of a program with no terminal (`StdStreams::Plain`): written like
+    /// the terminal, but with none of its line discipline, and not a terminal (no ioctl)
+    Out,
     Null,
     Zero,
     Random,
@@ -177,13 +180,28 @@ pub(crate) struct Files {
 }
 
 impl Files {
-    /// stdin, stdout and stderr on the terminal
-    pub fn standard() -> Files {
+    /// stdin, stdout and stderr, on the terminal or (`StdStreams::Plain`) as a container without
+    /// one has them: /dev/null to read, one output to write
+    pub fn standard(std: crate::StdStreams) -> Files {
         let mut f = Files::default();
-        let tty = f.add(Kind::Tty, 2);
-        for fd in 0..3 {
-            f.fds.insert(fd, (tty, false));
-            f.descs.get_mut(&tty).unwrap().refs = 3;
+        match std {
+            crate::StdStreams::Terminal => {
+                let tty = f.add(Kind::Tty, 2);
+                for fd in 0..3 {
+                    f.fds.insert(fd, (tty, false));
+                    f.descs.get_mut(&tty).unwrap().refs = 3;
+                }
+            },
+            crate::StdStreams::Plain => {
+                let null = f.add(Kind::Null, 0);
+                let out = f.add(Kind::Out, 1);
+                f.fds.insert(0, (null, false));
+                f.descs.get_mut(&null).unwrap().refs = 1;
+                for fd in 1..3 {
+                    f.fds.insert(fd, (out, false));
+                    f.descs.get_mut(&out).unwrap().refs = 2;
+                }
+            },
         }
         f
     }
@@ -349,6 +367,7 @@ impl Files {
                 Kind::Null => w.u(1),
                 Kind::Zero => w.u(2),
                 Kind::Random => w.u(3),
+                Kind::Out => w.u(15),
                 Kind::File { ino, pos } => {
                     w.u(4);
                     w.u(*ino);
@@ -452,6 +471,7 @@ impl Files {
                 12 => Kind::Signal { mask: r.u()? },
                 13 => Kind::Pidfd { pid: r.u()? as i64 },
                 14 => Kind::TimerFd(crate::timerfd::Timer::load(r)?),
+                15 => Kind::Out,
                 10 => {
                     let mut watch = BTreeMap::new();
                     for _ in 0..r.u()? {

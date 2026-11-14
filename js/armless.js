@@ -683,19 +683,28 @@
 
     // ------------------------------------------------------------ user mode
 
-    /** Start a program from the filesystem with no kernel: { argv, env, cwd, cols, rows }. */
+    /**
+     * Start a program from the filesystem with no kernel: { argv, env, cwd, cols, rows, plain_std, hostname }.
+     * `plain_std` gives it the standard streams of a container without a terminal (stdin reads end of file, stdout and
+     * stderr are no terminal); `hostname` is what uname says (default "armless").
+     */
     async _user_exec(user) {
       const e = this.exports;
       const argv = typeof user.argv === "string" ? [user.argv] : user.argv || [];
       if (!argv.length) throw new Error("armless: user mode needs a program (user.argv)");
       // argv and env as NUL-separated lists
       const list = (items) => utf8.encode(items.map((s) => s + "\0").join(""));
-      const parts = [list(argv), list(user.env || []), utf8.encode(user.cwd || "/")];
+      const parts = [list(argv), list(user.env || []), utf8.encode(user.cwd || "/"), utf8.encode(user.hostname || "")];
+      const opts = user.plain_std || user.hostname;
+      if (opts && !e.armless_user_exec_opts) throw new Error("armless: this build has no exec options");
       const ptrs = parts.map((b) => this._copy_in(b));
       try {
         // Its executable and loader may be fetched first
         for (;;) {
-          const r = e.armless_user_exec(ptrs[0], parts[0].length, ptrs[1], parts[1].length, ptrs[2], parts[2].length);
+          const r = opts ?
+            e.armless_user_exec_opts(ptrs[0], parts[0].length, ptrs[1], parts[1].length, ptrs[2], parts[2].length,
+              user.plain_std ? 1 : 0, ptrs[3], parts[3].length) :
+            e.armless_user_exec(ptrs[0], parts[0].length, ptrs[1], parts[1].length, ptrs[2], parts[2].length);
           if (r === 0) break;
           if (r < 0) throw new Error("armless: user mode: " + this._error());
           this._drain();

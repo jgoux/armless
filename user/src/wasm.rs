@@ -19,7 +19,7 @@ use armless::wasm::{now_ms, out, set_error, slice, string, vm};
 use armless::Event;
 
 use crate::host::{self, Instant};
-use crate::{ExecError, Process, Status};
+use crate::{ExecError, ExecOptions, Process, Status, StdStreams};
 
 std::thread_local! {
     /// The program, once `armless_user_exec` or `armless_user_restore` made it.
@@ -59,15 +59,50 @@ pub unsafe extern "C" fn armless_user_exec(
     cwd: u32,
     cwd_len: u32,
 ) -> i32 {
-    let (argv, env, cwd) = (
+    exec(
         list(&string(argv, argv_len)),
         list(&string(env, env_len)),
         string(cwd, cwd_len),
-    );
+        ExecOptions::default(),
+    )
+}
+
+/// `armless_user_exec` with options: `flags` bit 0 gives it the standard streams of a container
+/// without a terminal (`StdStreams::Plain`: stdin reads end of file, stdout and stderr are no
+/// terminal), and `hostname` (empty: "armless") is what uname says.
+///
+/// # Safety
+/// Each pointer must reference its length of readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn armless_user_exec_opts(
+    argv: u32,
+    argv_len: u32,
+    env: u32,
+    env_len: u32,
+    cwd: u32,
+    cwd_len: u32,
+    flags: u32,
+    hostname: u32,
+    hostname_len: u32,
+) -> i32 {
+    let hostname = string(hostname, hostname_len);
+    let opts = ExecOptions {
+        std: if flags & 1 != 0 { StdStreams::Plain } else { StdStreams::Terminal },
+        hostname: (!hostname.is_empty()).then_some(hostname),
+    };
+    exec(
+        list(&string(argv, argv_len)),
+        list(&string(env, env_len)),
+        string(cwd, cwd_len),
+        opts,
+    )
+}
+
+fn exec(argv: Vec<String>, env: Vec<String>, cwd: String, opts: ExecOptions) -> i32 {
     let cwd = if cwd.is_empty() { "/".to_string() } else { cwd };
     seed();
     let v = vm();
-    match Process::exec(&mut v.cpus[0], v.board.clone(), &argv, &env, &cwd) {
+    match Process::exec_with(&mut v.cpus[0], v.board.clone(), &argv, &env, &cwd, &opts) {
         Ok(p) => {
             PROCESS.set(Some(p));
             0

@@ -280,6 +280,13 @@ x0–x5, answers it in x0, and resumes at ELR.
   ISIG, Ctrl-C, Ctrl-\ and Ctrl-Z are SIGINT, SIGQUIT and SIGTSTP, flushing the input and the
   output not taken yet (unless NOFLSH) and echoing `^C`; a new size is SIGWINCH; output
   newlines start a line (ONLCR).
+- **Without a terminal:** `ExecOptions { std: StdStreams::Plain, .. }` (`Process::exec_with`;
+  `armless-exec --plain-std`; `armless_user_exec_opts`; `plain_std` in the JS options) starts the
+  program as a container with no tty has it: stdin is `/dev/null` (end of file, `isatty` false),
+  stdout and stderr are character devices that are no terminal (no TCGETS, no ONLCR) and write to
+  the same output (`take_output`, console events), and `/dev/stdin`, `/dev/stdout` and
+  `/dev/stderr` open the same. `ExecOptions::hostname` (`--hostname`, `hostname`) is what uname
+  and `/proc/sys/kernel/hostname` say ("armless" by default). Both are in the saved state.
 - **Pipes, eventfd, epoll** (edge-triggered and one-shot too), **poll and select.**
 - **File locks** (user/src/locks.rs), as Linux keeps them: record locks (`fcntl` F_GETLK,
   F_SETLK, F_SETLKW) are a process's, on byte ranges, and go when it closes any descriptor of the
@@ -534,6 +541,7 @@ and then, instead of a boot:
 | export | |
 |---|---|
 | `armless_user_exec(argv, len, env, len, cwd, len)` | start a program (argv and env NUL-separated): 0 started, 1 its files are being fetched (blob events: provide them, call again), -1 failed |
+| `armless_user_exec_opts(argv, len, env, len, cwd, len, flags, hostname, len)` | `armless_user_exec` with options: `flags` bit 0 is no terminal (`StdStreams::Plain`), `hostname` (empty: armless) is what uname says |
 | `armless_user_restore(ptr, len)` | the process of a snapshot (`Process::save`'s bytes), after `armless_state_*` restored the machine |
 | `armless_user_run(budget_ms)` | 0 its time ran out, 1 idle, 2 exited, 3 faulted (the reason in `armless_error`), -1 no process |
 | `armless_user_wake_ms()` | after 1: the `microtick()` time of its next deadline, or -1 (only input or a blob wakes it) |

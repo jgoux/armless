@@ -77,6 +77,7 @@ impl Process {
                 s.into_bytes()
             },
             b"/proc/sys/kernel/osrelease" => b"6.6.0-armless-user\n".to_vec(),
+            b"/proc/sys/kernel/hostname" => format!("{}\n", self.hostname).into_bytes(),
             b"/sys/fs/cgroup/cpu.max" => b"max 100000\n".to_vec(),
             _ => return None,
         })
@@ -135,6 +136,43 @@ impl Process {
         let absolute = path.first() == Some(&b'/');
         if absolute {
             if let Some((kind, _, _)) = device(path) {
+                // /dev/stdin, /dev/stdout and /dev/stderr are what descriptors 0, 1 and 2 are
+                // (Linux's links to /proc/self/fd/N): a file is opened again (new offset, the
+                // flags asked), a pipe or socket is the same open object (as dup), a closed
+                // descriptor is no file
+                let std = match path {
+                    b"/dev/stdin" => Some(0),
+                    b"/dev/stdout" => Some(1),
+                    b"/dev/stderr" => Some(2),
+                    _ => None,
+                };
+                let mut kind = kind;
+                if let Some(fd) = std {
+                    let Some(d) = self.files.get(fd) else {
+                        return Ret::Val(-ENOENT);
+                    };
+                    match &d.kind {
+                        Kind::Tty => {},
+                        k @ (Kind::Null | Kind::Out | Kind::Zero | Kind::Random) => kind = k.clone(),
+                        Kind::File { ino, .. } | Kind::Dir { ino, .. } => {
+                            let ino = *ino;
+                            return match self.fs(|fs| files::find_path(fs, ino)).flatten() {
+                                Some(p) => self.openat(AT_FDCWD, &p, flags & !(O_CREAT | O_EXCL), mode),
+                                None => Ret::Val(-ENOENT),
+                            };
+                        },
+                        Kind::Mem { data, .. } => {
+                            kind = Kind::Mem {
+                                data: data.clone(),
+                                pos: 0,
+                            }
+                        },
+                        _ => {
+                            let d = self.files.desc_of(fd).unwrap();
+                            return Ret::Val(self.new_fd(d, 0, cloexec));
+                        },
+                    }
+                }
                 let d = self.files.add(kind, status);
                 return Ret::Val(self.new_fd(d, 0, cloexec));
             }
@@ -223,7 +261,7 @@ impl Process {
         let d = self.files.get(fd).ok_or(-EBADF)?;
         Ok(match &d.kind {
             Kind::Tty => Stat::device(files::S_IFCHR | 0o620, 0x8800),
-            Kind::Null => Stat::device(files::S_IFCHR | 0o666, 0x103),
+            Kind::Null | Kind::Out => Stat::device(files::S_IFCHR | 0o666, 0x103),
             Kind::Zero => Stat::device(files::S_IFCHR | 0o666, 0x105),
             Kind::Random => Stat::device(files::S_IFCHR | 0o666, 0x109),
             Kind::File { ino, .. } | Kind::Dir { ino, .. } => {
@@ -357,6 +395,7 @@ impl Process {
                 Some(Kind::Sock(id)) => Ok(format!("socket:[{id}]").into_bytes()),
                 Some(Kind::Tty) => Ok(b"/dev/tty".to_vec()),
                 Some(Kind::Null) => Ok(b"/dev/null".to_vec()),
+                Some(Kind::Out) => Ok(b"/dev/stdout".to_vec()),
                 Some(Kind::Zero) => Ok(b"/dev/zero".to_vec()),
                 Some(Kind::Random) => Ok(b"/dev/urandom".to_vec()),
                 Some(Kind::Event { .. }) => Ok(b"anon_inode:[eventfd]".to_vec()),
