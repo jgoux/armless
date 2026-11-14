@@ -190,6 +190,28 @@ fn clamp(ns: u128) -> u64 {
     ns.min(FAR as u128) as u64
 }
 
+/// A deadline `left` ns off when the process was saved, once it has been asleep `asleep` ns: what
+/// is left of it, and how many times it came due in the sleep (one that repeats every `every` ns,
+/// 0 for once, comes due each period).
+pub(crate) fn after_sleep(left: u64, every: u64, asleep: u64) -> (u64, u64) {
+    if left > asleep {
+        return (left - asleep, 0);
+    }
+    let late = asleep - left;
+    if every == 0 {
+        return (0, 1);
+    }
+    (every - late % every, late / every + 1)
+}
+
+/// When a timer saved `left` ns off is due after the sleep: at once if it came due in it
+fn due_after_sleep(now: Instant, left: u64, every: u64, asleep: u64) -> Instant {
+    match after_sleep(left, every, asleep) {
+        (left, 0) => now + Duration::from_nanos(clamp(left as u128)),
+        _ => now,
+    }
+}
+
 impl Timers {
     fn cpu(&self, scope: Scope, now: Instant) -> u64 {
         // What the slices running now (one per CPU) have had so far
@@ -381,12 +403,13 @@ impl Timers {
     }
 
     /// Process `pid`'s ITIMER_REAL from its record (`save_real`)
-    pub(crate) fn load_real(&mut self, r: &mut R, pid: i64, now: Instant) -> Result<(), String> {
+    pub(crate) fn load_real(&mut self, r: &mut R, pid: i64, now: Instant, asleep: u64) -> Result<(), String> {
         let left = r.u()?;
         if left != u64::MAX {
+            let interval = r.u()?;
             let arm = Arm {
-                due: Due::At(now + Duration::from_nanos(clamp(left as u128))),
-                interval: r.u()?,
+                due: Due::At(due_after_sleep(now, left, interval, asleep)),
+                interval,
             };
             self.itimers.push(ITimer {
                 pid,
@@ -398,7 +421,7 @@ impl Timers {
     }
 
     /// The timers' section of a snapshot (`save`), into what `load_real` has read
-    pub(crate) fn load(&mut self, r: &mut R, now: Instant) -> Result<(), String> {
+    pub(crate) fn load(&mut self, r: &mut R, now: Instant, asleep: u64) -> Result<(), String> {
         let s = self;
         for _ in 0..r.u()? {
             let (pid, ns) = (r.u()? as i64, r.u()?);
@@ -413,16 +436,20 @@ impl Timers {
             s.next_id.insert(pid, id);
         }
         let arm = |r: &mut R| -> Result<Option<Arm>, String> {
-            let due = match r.u()? {
-                0 => return Ok(None),
-                1 => Due::At(now + Duration::from_nanos(clamp(r.u()? as u128))),
-                2 => Due::Cpu(r.u()?),
-                k => return Err(format!("unknown timer due {k}")),
+            let kind = r.u()?;
+            if kind == 0 {
+                return Ok(None);
+            }
+            if kind > 2 {
+                return Err(format!("unknown timer due {kind}"));
+            }
+            let (value, interval) = (r.u()?, r.u()?);
+            // (CPU time does not pass in the sleep: only the clocks' due times move)
+            let due = match kind {
+                1 => Due::At(due_after_sleep(now, value, interval, asleep)),
+                _ => Due::Cpu(value),
             };
-            Ok(Some(Arm {
-                due,
-                interval: r.u()?,
-            }))
+            Ok(Some(Arm { due, interval }))
         };
         for _ in 0..r.u()? {
             let (pid, which) = (r.u()? as i64, r.u()? as u32);

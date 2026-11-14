@@ -187,15 +187,17 @@ pub extern "C" fn armless_user_save() -> u32 {
 
 /// The process from its saved state (`armless_user_save`, or `Process::save` natively), on the
 /// machine restored from the snapshot it was saved with (`armless_state_*` first). It asks again
-/// for blobs it was waiting on. Returns 0 or -1 (see `armless_error`).
+/// for blobs it was waiting on. `asleep_ms` is how long the state sat saved: the process's monotonic
+/// clocks go on by that much and what was due in it is due now (`Process::restore`); pass 0 to
+/// resume where it stopped. Returns 0 or -1 (see `armless_error`).
 ///
 /// # Safety
 /// `ptr` must reference `len` readable bytes.
 #[no_mangle]
-pub unsafe extern "C" fn armless_user_restore(ptr: u32, len: u32) -> i32 {
+pub unsafe extern "C" fn armless_user_restore(ptr: u32, len: u32, asleep_ms: f64) -> i32 {
     seed();
     let v = vm();
-    match Process::restore(&mut v.cpus[0], Some(v.board.clone()), slice(ptr, len)) {
+    match Process::restore(&mut v.cpus[0], Some(v.board.clone()), slice(ptr, len), Duration::from_secs_f64(asleep_ms.max(0.0) / 1e3)) {
         Ok(p) => {
             PROCESS.set(Some(p));
             0

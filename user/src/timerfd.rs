@@ -14,6 +14,7 @@ use crate::errno::{EAGAIN, EBADF, EFAULT, EINVAL};
 use crate::files::{Desc, Kind};
 use crate::host::Instant;
 use crate::ser::{R, W};
+use crate::timer::after_sleep;
 use crate::{Process, Ret};
 
 const CLOCK_REALTIME: u64 = 0;
@@ -67,16 +68,19 @@ impl Timer {
         w.u(self.ticks);
     }
 
-    pub fn load(r: &mut R) -> Result<Timer, String> {
+    /// The timer from its `save`, the process having been asleep `asleep` ns since: the
+    /// expirations in the sleep are counted, as if something had looked all along.
+    pub fn load(r: &mut R, asleep: u64) -> Result<Timer, String> {
         let now = Instant::now();
-        let clock = r.u()?;
-        let left = r.u()?;
-        Ok(Timer {
-            clock,
-            next: (left != u64::MAX).then(|| now + Duration::from_nanos(left)),
-            every: Duration::from_nanos(r.u()?),
-            ticks: r.u()?,
-        })
+        let (clock, left, every, ticks) = (r.u()?, r.u()?, r.u()?, r.u()?);
+        let mut t = Timer { clock, next: None, every: Duration::from_nanos(every), ticks };
+        if left != u64::MAX {
+            let (left, n) = after_sleep(left, every, asleep);
+            t.ticks = t.ticks.saturating_add(n);
+            // (One that does not repeat and came due is spent)
+            t.next = (every != 0 || n == 0).then(|| now + Duration::from_nanos(left));
+        }
+        Ok(t)
     }
 }
 
