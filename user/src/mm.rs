@@ -234,6 +234,11 @@ impl Frames {
         }
     }
 
+    /// How much of RAM, from its start, has had a frame handed out: the rest is zero
+    pub(crate) fn in_use(&self) -> u64 {
+        self.next * PAGE
+    }
+
     pub(crate) fn load(&mut self, r: &mut R) -> Result<(), String> {
         self.next = r.u()?;
         if self.next > self.refs.len() as u64 {

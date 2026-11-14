@@ -798,8 +798,10 @@ pub struct StateSaver {
     at: usize,
     later: std::collections::VecDeque<crate::ser::Later>,
     later_at: usize,
-    /// The next RAM page to look at
+    /// The next RAM page to look at, and where they end: the pages from `pages` on are zero
+    /// (`Machine::set_ram_in_use`) and not looked at
     page: usize,
+    pages: usize,
     done: bool,
 }
 
@@ -811,6 +813,8 @@ impl StateSaver {
         cpus: &mut [&mut Cpu<H>],
         n: usize,
     ) -> Result<StateSaver, String> {
+        // Whatever the answer, this snapshot is the one it was for
+        let in_use = board.io.machine.take_ram_in_use();
         if board.io.machine.gic_v3.load(std::sync::atomic::Ordering::Relaxed) {
             // Its interrupt controller's state is in the host's kernel (KVM's GICv3), which a
             // snapshot does not hold yet
@@ -842,6 +846,10 @@ impl StateSaver {
             later: later.into(),
             later_at: 0,
             page: 0,
+            pages: mem
+                .len()
+                .min(usize::try_from(in_use).unwrap_or(usize::MAX))
+                .div_ceil(PAGE),
             done: false,
         })
     }
@@ -903,7 +911,7 @@ impl StateSaver {
             return true;
         }
         let mem = &board.io.mem;
-        while self.page * PAGE < mem.len() && out.len() - start + 4 + PAGE <= max {
+        while self.page < self.pages && out.len() - start + 4 + PAGE <= max {
             let from = self.page * PAGE;
             let n = PAGE.min(mem.len() - from);
             if !mem.is_zero(from, n) {
@@ -914,7 +922,7 @@ impl StateSaver {
             }
             self.page += 1;
         }
-        if self.page * PAGE >= mem.len() && !self.done {
+        if self.page >= self.pages && !self.done {
             out.extend_from_slice(&END.to_le_bytes());
             self.done = true;
         }
@@ -1239,6 +1247,42 @@ mod restore_tests {
             "a page the snapshot doesn't have is zero again"
         );
         assert!(mem.is_zero(12 * PAGE, PAGE), "untouched pages stay zero");
+    }
+
+    #[test]
+    fn a_save_stops_at_the_ram_a_program_said_it_used_and_only_once() {
+        let new = || {
+            crate::runner::new_vm(Config {
+                memory_size: 16 << 20,
+                cpus: 1,
+                ..Default::default()
+            })
+            .unwrap()
+            .0
+        };
+        let mut vm = new();
+        let mem = vm.board.io.mem.alias();
+        mem.store(3 * PAGE, 1, 0x33);
+        mem.store(9 * PAGE, 1, 0x99);
+        // The program has had pages 0..=4: the one at 9 is past that, and not in the snapshot
+        vm.board.io.machine.set_ram_in_use(5 * PAGE as u64);
+        let limited = vm.save_state();
+        let mut other = new();
+        other.load_state(&limited).unwrap();
+        assert_eq!(other.board.io.mem.load(3 * PAGE, 1), 0x33);
+        assert_eq!(other.board.io.mem.load(9 * PAGE, 1), 0, "past the limit: not saved");
+        // The limit was for that snapshot: the next one holds all of RAM again
+        let all = vm.save_state();
+        other.load_state(&all).unwrap();
+        assert_eq!(other.board.io.mem.load(9 * PAGE, 1), 0x99);
+        // A limit in the middle of a page keeps the page; one past RAM changes nothing
+        for limit in [9 * PAGE as u64 + 1, u64::MAX - 1] {
+            vm.board.io.machine.set_ram_in_use(limit);
+            let state = vm.save_state();
+            let mut fresh = new();
+            fresh.load_state(&state).unwrap();
+            assert_eq!(fresh.board.io.mem.load(9 * PAGE, 1), 0x99, "limit {limit}");
+        }
     }
 }
 

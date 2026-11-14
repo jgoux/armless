@@ -204,6 +204,39 @@ fn a_saved_process_goes_on_in_another_machine() {
 }
 
 #[test]
+fn a_save_leaves_out_the_ram_the_process_never_had() {
+    let mut vm = machine();
+    let mem = vm.cpus[0].mem().alias();
+    let last = mem.len() - 4096;
+    let mut p = Process::exec_bytes(&mut vm.cpus[0], None, &echo(), &["echo".into()], &[]).unwrap();
+    p.input(b"before\n");
+    assert_eq!(run(&mut p, &mut vm.cpus).0, b"before\r\nbefore\r\n");
+    let process = p.save(&vm.cpus[0]);
+    // The process has had a few frames from the bottom. Something no frame of its is writes the
+    // last page of RAM: a save that reads all of RAM would hold it, and this one is not to
+    mem.store(last, 1, 0x5a);
+    let state = vm.save_state();
+    assert!(
+        state.len() < 1 << 20,
+        "a few pages of a {} MiB machine: {} bytes",
+        mem.len() >> 20,
+        state.len()
+    );
+    drop(p);
+
+    // Restored onto a machine that has run, the page it lacks is zeroed as in any restore
+    let mut other = machine();
+    other.cpus[0].mem().store(last, 1, 0x77);
+    other.load_state(&state).unwrap();
+    assert_eq!(other.cpus[0].mem().load(last, 1), 0, "not in the snapshot");
+    let mut p = Process::restore(&mut other.cpus[0], None, &process).unwrap();
+    p.input(b"after\n");
+    let (out, status) = run(&mut p, &mut other.cpus);
+    assert_eq!(out, b"after\r\nafter\r\n");
+    assert!(matches!(status, Status::Idle(None)), "{status:?}");
+}
+
+#[test]
 fn a_dynamic_or_foreign_executable_is_refused() {
     let mut vm = machine();
     let mut e = hello();

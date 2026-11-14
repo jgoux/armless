@@ -359,6 +359,10 @@ pub struct Machine {
     /// One flag per RAM page: some CPU's JIT holds code translated from it
     /// (device DMA into such a page invalidates that code).
     pub code_pages: Vec<AtomicU8>,
+    /// How much of RAM, from its start, a program run on the CPUs by the host (user mode) ever
+    /// handed out, as its last save said (`set_ram_in_use`); u64::MAX when nothing said, as for
+    /// a guest kernel. The next snapshot leaves out the pages from there on, which are zero.
+    ram_in_use: AtomicU64,
     waker: SpinLock<Option<Waker>>,
 }
 
@@ -410,6 +414,7 @@ impl Machine {
             sev: AtomicU32::new(0),
             host_cores: AtomicU32::new(0),
             code_pages: zeroed_flags(memory_size.div_ceil(4096)),
+            ram_in_use: AtomicU64::new(u64::MAX),
             waker: SpinLock::new(None),
         };
         // CPU 0 starts running; the others wait for PSCI CPU_ON.
@@ -419,6 +424,20 @@ impl Machine {
             c.attn.store(1, Ordering::Relaxed);
         }
         m
+    }
+
+    /// The host's program has put nothing in RAM at `bytes` or beyond (user mode's frames come
+    /// from the bottom up, and none past that was ever given out): the next snapshot (the
+    /// machine's `StateSaver`) neither reads those pages nor holds them, a restore leaves them
+    /// zero. For the one snapshot taken with the program stopped, as `Process::save` leaves
+    /// it; it is forgotten once that snapshot starts.
+    pub fn set_ram_in_use(&self, bytes: u64) {
+        self.ram_in_use.store(bytes, Ordering::Relaxed);
+    }
+
+    /// What `set_ram_in_use` said since the last call, u64::MAX if nothing did.
+    pub fn take_ram_in_use(&self) -> u64 {
+        self.ram_in_use.swap(u64::MAX, Ordering::Relaxed)
     }
 
     pub fn set_waker(&self, waker: Waker) {

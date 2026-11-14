@@ -1411,6 +1411,9 @@ impl Process {
     /// The processes' state for a snapshot (the machine's own snapshot holds its memory and
     /// filesystem): every process (its address space, descriptors, signals) and thread, its
     /// waits as time left, the descriptions the descriptors refer to, the terminal, the clock.
+    /// Save the process first and then the machine, which leaves out the RAM no frame was ever
+    /// handed out in (it is zero, and the machine's save does not read it): `Process::save` tells
+    /// the machine where that starts, for the next snapshot of it only.
     pub fn save<H: Host>(&mut self, cpu: &Cpu<H>) -> Vec<u8> {
         self.park(cpu);
         self.compact();
@@ -1419,7 +1422,11 @@ impl Process {
         let now = Instant::now();
         let mut w = W(MAGIC.to_vec());
         w.u(self.ram_size);
-        self.frames.borrow_mut().save(&mut w);
+        {
+            let mut f = self.frames.borrow_mut();
+            f.save(&mut w);
+            cpu.machine.set_ram_in_use(f.in_use());
+        }
         w.u(self.asids.get().0);
         w.u(self.filled.get());
         w.u(self.next_id as u64);
